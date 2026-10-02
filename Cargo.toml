@@ -1,0 +1,23 @@
+[package]
+name = "v8-etw"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Windows ETW analysis for V8, cppgc, symbols, heap reports, and lifecycle data"
+license = "MIT"
+repository = "https://github.com/deepak1556/v8-etw"
+keywords = ["v8", "etw", "profiling", "windows"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+crossterm = "0.28"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+unicode-width = "=0.2.0"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_Etw",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Time",
+] }

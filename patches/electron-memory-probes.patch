@@ -1,0 +1,765 @@
+diff --git a/filenames.gni b/filenames.gni
+index 5845793f2a..562827df4f 100644
+--- a/filenames.gni
++++ b/filenames.gni
+@@ -115,6 +115,8 @@ filenames = {
+     "shell/common/api/electron_api_native_image_win.cc",
+     "shell/common/application_info_win.cc",
+     "shell/common/language_util_win.cc",
++    "shell/common/memory_etw_probe.h",
++    "shell/common/memory_etw_probe_win.cc",
+     "shell/common/node_bindings_win.cc",
+     "shell/common/node_bindings_win.h",
+     "shell/common/platform_util_win.cc",
+diff --git a/shell/common/api/electron_api_v8_util.cc b/shell/common/api/electron_api_v8_util.cc
+index 4c0f90a931..e201430189 100644
+--- a/shell/common/api/electron_api_v8_util.cc
++++ b/shell/common/api/electron_api_v8_util.cc
+@@ -12,6 +12,7 @@
+ #include "base/process/process.h"
+ #include "base/run_loop.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
+ #include "gin/arguments.h"
+ #include "shell/common/gin_helper/dictionary.h"
+ #include "shell/common/gin_helper/promise.h"
+@@ -19,6 +20,10 @@
+ #include "url/origin.h"
+ #include "v8/include/v8-profiler.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "shell/common/memory_etw_probe.h"
++#endif
++
+ namespace gin {
+ 
+ template <typename Type1, typename Type2>
+@@ -157,6 +162,9 @@ void Initialize(v8::Local<v8::Object> exports,
+                 void* priv) {
+   v8::Isolate* const isolate = v8::Isolate::GetCurrent();
+   gin_helper::Dictionary dict{isolate, exports};
++#if BUILDFLAG(IS_WIN)
++  electron::RegisterMemoryETWProbe(&dict);
++#endif
+   dict.SetMethod<&GetHiddenValue>("getHiddenValue");
+   dict.SetMethod<&SetHiddenValue>("setHiddenValue");
+   dict.SetMethod<&TakeHeapSnapshot>("takeHeapSnapshot");
+diff --git a/shell/common/memory_etw_probe.h b/shell/common/memory_etw_probe.h
+new file mode 100644
+index 0000000000..a14c5b53d0
+--- /dev/null
++++ b/shell/common/memory_etw_probe.h
+@@ -0,0 +1,10 @@
++#ifndef ELECTRON_SHELL_COMMON_MEMORY_ETW_PROBE_H_
++#define ELECTRON_SHELL_COMMON_MEMORY_ETW_PROBE_H_
++
++#include "shell/common/gin_helper/dictionary.h"
++
++namespace electron {
++void RegisterMemoryETWProbe(gin_helper::Dictionary* exports);
++}
++
++#endif  // ELECTRON_SHELL_COMMON_MEMORY_ETW_PROBE_H_
+diff --git a/shell/common/memory_etw_probe_win.cc b/shell/common/memory_etw_probe_win.cc
+new file mode 100644
+index 0000000000..740b5a8c2d
+--- /dev/null
++++ b/shell/common/memory_etw_probe_win.cc
+@@ -0,0 +1,697 @@
++#include "shell/common/memory_etw_probe.h"
++
++#include <windows.h>
++
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/rand_util.h"
++#include "base/sampling_heap_profiler/poisson_allocation_sampler.h"
++#include "base/synchronization/lock.h"
++#include "base/trace_event/trace_logging_minimal_win.h"
++#include "gin/arguments.h"
++#include "partition_alloc/partition_address_space.h"
++#include "partition_alloc/partition_root.h"
++#include "partition_alloc/partition_stats.h"
++#include "shell/common/node_includes.h"
++#include "v8/include/cppgc/allocation.h"
++#include "v8/include/cppgc/garbage-collected.h"
++#include "v8/include/cppgc/persistent.h"
++#include "v8/include/v8-cppgc.h"
++#include "v8/include/v8-profiler.h"
++
++namespace electron {
++namespace {
++
++TlmProvider& Provider() {
++  static base::NoDestructor<TlmProvider> provider;
++  return *provider;
++}
++
++const GUID kMemoryGuid = {0x9eeb8a39,
++                          0x89e8,
++                          0x4c86,
++                          {0x9f, 0x88, 0x33, 0x08, 0x37, 0x99, 0xf7, 0xd9}};
++
++// Chromium's implementation exposes the ETW write status, unlike the SDK macro.
++TlmUInt64Field TraceLoggingUInt64(uint64_t value, const char* name) {
++  return TlmUInt64Field(name, value);
++}
++TlmUInt64Field TraceLoggingUInt32(uint32_t value, const char* name) {
++  return TlmUInt64Field(name, value);
++}
++TlmUInt64Field TraceLoggingBool(bool value, const char* name) {
++  return TlmUInt64Field(name, value);
++}
++TlmInt64Field TraceLoggingInt32(int32_t value, const char* name) {
++  return TlmInt64Field(name, value);
++}
++TlmUtf8StringField TraceLoggingString(const char* value, const char* name) {
++  return TlmUtf8StringField(name, value);
++}
++TlmUInt64Field TraceLoggingKeyword(uint64_t value) {
++  return TlmUInt64Field("EnabledKeyword", value);
++}
++class PointerField final : public TlmFieldWithConstants<1, 16> {
++ public:
++  PointerField(const char* name, const void* value)
++      : TlmFieldWithConstants(name),
++        value_(reinterpret_cast<uintptr_t>(value)) {}
++  void FillEventDescriptor(EVENT_DATA_DESCRIPTOR* output) const noexcept {
++    EventDataDescCreate(output, &value_, sizeof(value_));
++  }
++
++ private:
++  uintptr_t value_;
++};
++PointerField TraceLoggingPointer(const void* value, const char* name) {
++  return PointerField(name, value);
++}
++class BinaryField final : public TlmFieldWithConstants<2, 14> {
++ public:
++  BinaryField(const char* name, const void* value, uint16_t size)
++      : TlmFieldWithConstants(name), value_(value), size_(size) {}
++  void FillEventDescriptor(EVENT_DATA_DESCRIPTOR* output) const noexcept {
++    // TlmProvider allocates the field's declared descriptor count.
++    auto descriptors = UNSAFE_BUFFERS(base::span(output, GetDataDescCount()));
++    EventDataDescCreate(&descriptors[0], &size_, sizeof(size_));
++    EventDataDescCreate(&descriptors[1], value_, size_);
++  }
++
++ private:
++  const void* value_;
++  uint16_t size_;
++};
++BinaryField TraceLoggingBinary(const void* value,
++                               size_t size,
++                               const char* name) {
++  return BinaryField(name, value, static_cast<uint16_t>(size));
++}
++enum class ProviderTag { kMemory };
++constexpr auto g_memory_provider = ProviderTag::kMemory;
++template <typename... Fields>
++ULONG TraceLoggingWrite(ProviderTag,
++                        const char* name,
++                        const Fields&... fields) {
++  if (!Provider().IsEnabled(5, 1))
++    return ERROR_INVALID_STATE;
++  return Provider().WriteEvent(name, TlmEventDescriptor(5, 1), fields...);
++}
++bool TraceLoggingProviderEnabled(ProviderTag, uint8_t level, uint64_t keyword) {
++  return Provider().IsEnabled(level, keyword);
++}
++ULONG TraceLoggingRegister(ProviderTag) {
++  return Provider().Register("Electron.Memory", kMemoryGuid, {});
++}
++
++class NativeObserver final
++    : public base::PoissonAllocationSampler::SamplesObserver {
++ public:
++  void SampleAdded(void* address,
++                   size_t size,
++                   size_t total,
++                   base::allocator::dispatcher::AllocationSubsystem type,
++                   const char* context) override {
++    if (!enabled.load(std::memory_order_acquire))
++      return;
++    base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++    void* frames[48];
++    const USHORT depth = CaptureStackBackTrace(0, 48, frames, nullptr);
++    char heap[32] = "non-partition-allocator";
++    if (partition_alloc::IsManagedByPartitionAlloc(
++            reinterpret_cast<uintptr_t>(address))) {
++      auto* root = partition_alloc::PartitionRoot::GetRootFromAddress(address);
++      snprintf(heap, sizeof(heap), "root-%p", static_cast<void*>(root));
++    }
++    const ULONG result = TraceLoggingWrite(
++        g_memory_provider, "NativeSampleAdded",
++        TraceLoggingUInt64(session.load(), "Session"),
++        TraceLoggingPointer(address, "Address"),
++        TraceLoggingUInt64(size, "RequestedBytes"),
++        TraceLoggingUInt64(total, "EstimatedBytes"),
++        TraceLoggingUInt32(static_cast<uint32_t>(type), "AllocatorSubsystem"),
++        TraceLoggingString(heap, "Heap"),
++        TraceLoggingString(context ? context : "", "AllocationContext"),
++        TraceLoggingBinary(frames, depth * sizeof(void*), "NativeStack"));
++    if (result != ERROR_SUCCESS)
++      failed_writes.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  void SampleRemoved(void* address) override {
++    if (!enabled.load(std::memory_order_acquire))
++      return;
++    base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++    const ULONG result =
++        TraceLoggingWrite(g_memory_provider, "NativeSampleRemoved",
++                          TraceLoggingUInt64(session.load(), "Session"),
++                          TraceLoggingPointer(address, "Address"));
++    if (result != ERROR_SUCCESS)
++      failed_writes.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  std::atomic<bool> enabled{false};
++  std::atomic<uint64_t> session{0};
++  std::atomic<uint64_t> failed_writes{0};
++  v8::Isolate* owner = nullptr;
++  bool installed = false;
++  bool observing = false;
++  bool lifetime_started = false;
++  std::atomic<bool> lifetime_all_stacks{false};
++  ULONG registration_error = ERROR_SUCCESS;
++  base::Lock control_lock;
++  uint64_t cppgc_interval = 128 * 1024;
++  uint64_t cppgc_bytes_until_sample = 0;
++  uint64_t cppgc_allocated_bytes = 0;
++  uint64_t cppgc_allocation_count = 0;
++};
++
++NativeObserver& Observer() {
++  static base::NoDestructor<NativeObserver> observer;
++  return *observer;
++}
++
++thread_local uint64_t g_last_lifetime_allocation = 0;
++thread_local const void* g_last_lifetime_heap = nullptr;
++
++void LifetimeEvent(void* data, const cppgc::internal::LifetimeEvent& event) {
++  auto* observer = static_cast<NativeObserver*>(data);
++  base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++  void* frames[48];
++  USHORT depth = 0;
++  if (event.kind == cppgc::internal::LifetimeEventKind::kAllocation) {
++    g_last_lifetime_allocation = event.sequence;
++    g_last_lifetime_heap = event.heap;
++    if (observer->lifetime_all_stacks.load())
++      depth = CaptureStackBackTrace(0, 48, frames, nullptr);
++  }
++  const ULONG result = TraceLoggingWrite(
++      g_memory_provider, "CppgcLifetime",
++      TraceLoggingUInt64(observer->session.load(), "Session"),
++      TraceLoggingPointer(event.heap, "HeapId"),
++      TraceLoggingUInt64(event.sequence, "Sequence"),
++      TraceLoggingUInt32(static_cast<uint32_t>(event.kind), "Kind"),
++      TraceLoggingUInt64(event.gc_epoch, "GcEpoch"),
++      TraceLoggingPointer(event.address, "Address"),
++      TraceLoggingPointer(event.other_address, "OtherAddress"),
++      TraceLoggingUInt64(event.bytes, "AllocatedBytes"),
++      TraceLoggingUInt64(event.requested_bytes, "RequestedBytes"),
++      TraceLoggingBool(
++          event.kind == cppgc::internal::LifetimeEventKind::kAllocation ||
++              event.kind == cppgc::internal::LifetimeEventKind::kResize,
++          "RequestedKnown"),
++      TraceLoggingUInt32(event.gc_info, "GCInfo"),
++      TraceLoggingBool(event.major_gc, "MajorGC"),
++      TraceLoggingString(event.type_name ? event.type_name : "", "TypeName"),
++      TraceLoggingBinary(frames, depth * sizeof(void*), "NativeStack"));
++  if (result != ERROR_SUCCESS)
++    observer->failed_writes.fetch_add(1, std::memory_order_relaxed);
++}
++
++bool WriteSucceeded(gin::Arguments* args, ULONG status) {
++  if (status == ERROR_SUCCESS)
++    return true;
++  args->ThrowTypeError("ETW memory probe write failed: " +
++                       std::to_string(status));
++  return false;
++}
++
++void CppgcAllocation(void* data, const void* address, size_t bytes) {
++  auto* observer = static_cast<NativeObserver*>(data);
++  observer->cppgc_allocated_bytes += bytes;
++  ++observer->cppgc_allocation_count;
++  if (bytes < observer->cppgc_bytes_until_sample) {
++    observer->cppgc_bytes_until_sample -= bytes;
++    return;
++  }
++  observer->cppgc_bytes_until_sample =
++      static_cast<uint64_t>(-std::log(1.0 - base::RandDouble()) *
++                            observer->cppgc_interval) +
++      1;
++  const double probability =
++      -std::expm1(-static_cast<double>(bytes) / observer->cppgc_interval);
++  const uint64_t estimated =
++      static_cast<uint64_t>(static_cast<double>(bytes) / probability + 0.5);
++  base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++  void* frames[48];
++  const USHORT depth = CaptureStackBackTrace(0, 48, frames, nullptr);
++  const ULONG result = TraceLoggingWrite(
++      g_memory_provider, "CppgcAllocationTraffic",
++      TraceLoggingUInt64(observer->session.load(), "Session"),
++      TraceLoggingPointer(address, "Address"),
++      TraceLoggingUInt64(bytes, "AllocatedBytes"),
++      TraceLoggingUInt64(estimated, "EstimatedTrafficBytes"),
++      TraceLoggingUInt64(g_last_lifetime_allocation,
++                         "LifetimeAllocationSequence"),
++      TraceLoggingPointer(g_last_lifetime_heap, "HeapId"),
++      TraceLoggingBinary(frames, depth * sizeof(void*), "NativeStack"));
++  if (result != ERROR_SUCCESS)
++    observer->failed_writes.fetch_add(1, std::memory_order_relaxed);
++}
++
++void StopLocked(v8::Isolate* isolate) {
++  auto& observer = Observer();
++  if (observer.owner != isolate)
++    return;
++  if (auto* cpp_heap = isolate->GetCppHeap())
++    if (observer.lifetime_started) {
++      cpp_heap->StopLifetimeObserverForTesting();
++      observer.lifetime_started = false;
++    }
++  if (auto* cpp_heap = isolate->GetCppHeap())
++    cpp_heap->SetAllocationObserverForTesting(nullptr, nullptr);
++  observer.enabled.store(false, std::memory_order_release);
++  if (observer.observing) {
++    base::PoissonAllocationSampler::Get()->RemoveSamplesObserver(&observer);
++    observer.observing = false;
++  }
++  isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
++  observer.owner = nullptr;
++  const ULONG result = TraceLoggingWrite(
++      g_memory_provider, "ProbeStopped",
++      TraceLoggingUInt64(observer.session.load(), "Session"),
++      TraceLoggingUInt64(observer.failed_writes.load(), "FailedWrites"));
++  if (result != ERROR_SUCCESS)
++    observer.failed_writes.fetch_add(1, std::memory_order_relaxed);
++}
++
++void Stop(void* data) {
++  base::AutoLock lock(Observer().control_lock);
++  StopLocked(static_cast<v8::Isolate*>(data));
++}
++
++void StartProbe(gin::Arguments* args) {
++  uint32_t interval = 128 * 1024;
++  if (args->Length() > 0 && !args->GetNext(&interval)) {
++    args->ThrowTypeError("Sampling interval must be an integer.");
++    return;
++  }
++  if (interval < 1024 || interval > 16 * 1024 * 1024) {
++    args->ThrowTypeError(
++        "Sampling interval must be between 1024 and 16777216.");
++    return;
++  }
++  bool history = false;
++  bool all_stacks = false;
++  if (args->Length() > 1 && !args->GetNext(&history)) {
++    args->ThrowTypeError("History must be a boolean.");
++    return;
++  }
++  if (args->Length() > 2 && !args->GetNext(&all_stacks)) {
++    args->ThrowTypeError("Full allocation stacks must be a boolean.");
++    return;
++  }
++  if (all_stacks && !history) {
++    args->ThrowTypeError("Full cppgc allocation stacks require exact history.");
++    return;
++  }
++  auto& observer = Observer();
++  base::AutoLock lock(observer.control_lock);
++  if (!observer.installed) {
++    args->ThrowTypeError("ETW provider registration failed: " +
++                         std::to_string(observer.registration_error));
++    return;
++  }
++  if (observer.owner) {
++    args->ThrowTypeError("A memory probe is already running in this process.");
++    return;
++  }
++  if (!TraceLoggingProviderEnabled(g_memory_provider, 5, 1)) {
++    args->ThrowTypeError(
++        "Start the Electron.Memory ETW provider before the probe.");
++    return;
++  }
++  if (!args->isolate()->GetHeapProfiler()->StartSamplingHeapProfiler(interval,
++                                                                     48)) {
++    args->ThrowTypeError("V8 sampling heap profiler is already running.");
++    return;
++  }
++  observer.owner = args->isolate();
++  observer.session.fetch_add(1);
++  observer.failed_writes.store(0);
++  observer.cppgc_interval = interval;
++  observer.cppgc_bytes_until_sample =
++      static_cast<uint64_t>(-std::log(1.0 - base::RandDouble()) * interval) + 1;
++  observer.cppgc_allocated_bytes = 0;
++  observer.cppgc_allocation_count = 0;
++  observer.lifetime_all_stacks.store(all_stacks);
++  g_last_lifetime_allocation = 0;
++  g_last_lifetime_heap = nullptr;
++  if (!WriteSucceeded(
++          args,
++          TraceLoggingWrite(
++              g_memory_provider, "ProbeStarted", TraceLoggingKeyword(1),
++              TraceLoggingUInt64(observer.session.load(), "Session"),
++              TraceLoggingUInt32(interval, "SamplingInterval"),
++              TraceLoggingUInt64(
++                  base::PoissonAllocationSampler::Get()->SamplingInterval(),
++                  "NativeSamplingInterval"),
++              TraceLoggingUInt32(1, "SchemaVersion")))) {
++    StopLocked(args->isolate());
++    return;
++  }
++  observer.enabled.store(true, std::memory_order_release);
++  base::PoissonAllocationSampler::Get()->AddSamplesObserver(&observer);
++  observer.observing = true;
++  if (auto* cpp_heap = args->isolate()->GetCppHeap())
++    cpp_heap->SetAllocationObserverForTesting(CppgcAllocation, &observer);
++  if (history) {
++    auto* cpp_heap = args->isolate()->GetCppHeap();
++    if (!cpp_heap ||
++        !cpp_heap->StartLifetimeObserverForTesting(LifetimeEvent, &observer)) {
++      StopLocked(args->isolate());
++      args->ThrowTypeError(
++          "Exact history requires a quiescent cppgc heap and no other lifetime "
++          "observer.");
++      return;
++    }
++    observer.lifetime_started = true;
++  }
++  node::AddEnvironmentCleanupHook(args->isolate(), Stop, args->isolate());
++}
++
++class PartitionDumper final : public partition_alloc::PartitionStatsDumper {
++ public:
++  explicit PartitionDumper(uint64_t checkpoint) : checkpoint_(checkpoint) {}
++
++  void PartitionDumpTotals(
++      const char* name,
++      const partition_alloc::PartitionMemoryStats* stats) override {
++    Record(TraceLoggingWrite(
++        g_memory_provider, "PartitionTotals",
++        TraceLoggingUInt64(checkpoint_, "Checkpoint"),
++        TraceLoggingString(name, "Heap"),
++        TraceLoggingUInt64(stats->total_mmapped_bytes, "ReservedBytes"),
++        TraceLoggingUInt64(stats->total_committed_bytes, "CommittedBytes"),
++        TraceLoggingUInt64(stats->total_allocated_bytes, "AllocatedBytes"),
++        TraceLoggingUInt64(stats->total_active_bytes, "ActiveBytes"),
++        TraceLoggingUInt64(stats->total_active_count, "ActiveCount"),
++        TraceLoggingUInt64(stats->total_resident_bytes, "ProvisionedBytes"),
++        TraceLoggingUInt64(stats->total_decommittable_bytes,
++                           "DecommittableBytes"),
++        TraceLoggingUInt64(stats->total_discardable_bytes,
++                           "DiscardableBytes")));
++  }
++  void PartitionsDumpBucketStats(
++      const char* name,
++      const partition_alloc::PartitionBucketMemoryStats* stats) override {
++    if (!stats->is_valid)
++      return;
++    Record(TraceLoggingWrite(
++        g_memory_provider, "PartitionBucket",
++        TraceLoggingUInt64(checkpoint_, "Checkpoint"),
++        TraceLoggingString(name, "Heap"),
++        TraceLoggingUInt32(stats->bucket_slot_size, "SlotBytes"),
++        TraceLoggingUInt32(stats->active_bytes, "ActiveBytes"),
++        TraceLoggingUInt32(stats->active_count, "ActiveCount"),
++        TraceLoggingUInt32(stats->resident_bytes, "ProvisionedBytes"),
++        TraceLoggingUInt32(stats->num_empty_slot_spans, "EmptySpans"),
++        TraceLoggingUInt32(stats->num_active_slot_spans, "ActiveSpans"),
++        TraceLoggingBool(stats->is_direct_map, "DirectMap")));
++  }
++  ULONG error() const { return error_; }
++
++ private:
++  void Record(ULONG error) {
++    if (error != ERROR_SUCCESS)
++      error_ = error;
++  }
++  uint64_t checkpoint_;
++  ULONG error_ = ERROR_SUCCESS;
++};
++
++void WorkloadMarker(gin::Arguments* args) {
++  std::string phase, suite;
++  uint32_t iteration;
++  if (!args->GetNext(&phase) || !args->GetNext(&iteration) ||
++      !args->GetNext(&suite) || phase.empty() || phase.size() > 128 ||
++      suite.empty() || suite.size() > 128 || iteration == 0) {
++    args->ThrowTypeError(
++        "A workload marker needs phase, positive iteration and suite.");
++    return;
++  }
++  base::AutoLock lock(Observer().control_lock);
++  if (Observer().owner != args->isolate()) {
++    args->ThrowTypeError("Start the memory probe on this isolate first.");
++    return;
++  }
++  base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++  WriteSucceeded(
++      args, TraceLoggingWrite(
++                g_memory_provider, "WorkloadMarker",
++                TraceLoggingString(phase.c_str(), "Phase"),
++                TraceLoggingString(suite.c_str(), "Suite"),
++                TraceLoggingUInt32(iteration, "Iteration"),
++                TraceLoggingUInt64(reinterpret_cast<uintptr_t>(args->isolate()),
++                                   "Isolate")));
++}
++
++void Checkpoint(gin::Arguments* args) {
++  std::string phase;
++  if (!args->GetNext(&phase) || phase.empty() || phase.size() > 128) {
++    args->ThrowTypeError(
++        "A memory checkpoint needs a nonempty phase of at most 128 bytes.");
++    return;
++  }
++  auto& observer = Observer();
++  base::AutoLock lock(observer.control_lock);
++  if (observer.owner != args->isolate()) {
++    args->ThrowTypeError("Start the memory probe on this isolate first.");
++    return;
++  }
++  base::PoissonAllocationSampler::ScopedMuteThreadSamples mute;
++  static std::atomic<uint64_t> sequence{0};
++  const uint64_t checkpoint = sequence.fetch_add(1) + 1;
++  if (!WriteSucceeded(
++          args,
++          TraceLoggingWrite(
++              g_memory_provider, "CheckpointBegin",
++              TraceLoggingUInt64(checkpoint, "Checkpoint"),
++              TraceLoggingString(phase.c_str(), "Phase"),
++              TraceLoggingUInt64(reinterpret_cast<uintptr_t>(args->isolate()),
++                                 "Isolate"),
++              TraceLoggingUInt64(observer.cppgc_allocated_bytes,
++                                 "CppgcAllocatedTrafficBytes"),
++              TraceLoggingUInt64(observer.cppgc_allocation_count,
++                                 "CppgcAllocationCount"))))
++    return;
++  v8::HeapStatistics totals;
++  args->isolate()->GetHeapStatistics(&totals);
++  if (!WriteSucceeded(
++          args,
++          TraceLoggingWrite(
++              g_memory_provider, "V8HeapTotals",
++              TraceLoggingUInt64(checkpoint, "Checkpoint"),
++              TraceLoggingUInt64(totals.used_heap_size(), "UsedBytes"),
++              TraceLoggingUInt64(totals.total_heap_size(), "HeapBytes"),
++              TraceLoggingUInt64(totals.total_physical_size(), "PhysicalBytes"),
++              TraceLoggingUInt64(totals.external_memory(), "ExternalBytes"),
++              TraceLoggingUInt64(totals.malloced_memory(), "MallocedBytes"))))
++    return;
++  for (size_t i = 0; i < args->isolate()->NumberOfHeapSpaces(); ++i) {
++    v8::HeapSpaceStatistics space;
++    if (!args->isolate()->GetHeapSpaceStatistics(&space, i)) {
++      args->ThrowTypeError("V8 heap-space statistics failed.");
++      return;
++    }
++    if (!WriteSucceeded(
++            args, TraceLoggingWrite(
++                      g_memory_provider, "V8Space",
++                      TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                      TraceLoggingString(space.space_name(), "Heap"),
++                      TraceLoggingUInt64(space.space_used_size(), "UsedBytes"),
++                      TraceLoggingUInt64(space.space_size(), "HeapBytes"),
++                      TraceLoggingUInt64(space.physical_space_size(),
++                                         "PhysicalBytes"))))
++      return;
++  }
++  if (auto* cpp_heap = args->isolate()->GetCppHeap()) {
++    if (observer.lifetime_started)
++      cpp_heap->EmitLifetimeTypeNamesForTesting();
++    const auto stats =
++        cpp_heap->CollectStatistics(cppgc::HeapStatistics::kDetailed);
++    if (!WriteSucceeded(
++            args,
++            TraceLoggingWrite(
++                g_memory_provider, "CppgcTotals",
++                TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                TraceLoggingUInt64(stats.used_size_bytes, "UsedBytes"),
++                TraceLoggingUInt64(stats.committed_size_bytes,
++                                   "CommittedBytes"),
++                TraceLoggingUInt64(stats.resident_size_bytes, "ResidentBytes"),
++                TraceLoggingUInt64(stats.pooled_memory_size_bytes,
++                                   "PooledBytes"))))
++      return;
++    for (const auto& space : stats.space_stats) {
++      if (!WriteSucceeded(
++              args, TraceLoggingWrite(
++                        g_memory_provider, "CppgcSpace",
++                        TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                        TraceLoggingString(space.name.c_str(), "Heap"),
++                        TraceLoggingUInt64(space.used_size_bytes, "UsedBytes"),
++                        TraceLoggingUInt64(space.committed_size_bytes,
++                                           "CommittedBytes"))))
++        return;
++      for (const auto& page : space.page_stats) {
++        for (size_t i = 0; i < page.object_statistics.size(); ++i) {
++          const auto& type = page.object_statistics[i];
++          if (type.object_count == 0)
++            continue;
++          if (i >= stats.type_names.size()) {
++            args->ThrowTypeError("Cppgc type histogram/name count mismatch.");
++            return;
++          }
++          if (!WriteSucceeded(
++                  args,
++                  TraceLoggingWrite(
++                      g_memory_provider, "CppgcType",
++                      TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                      TraceLoggingString(space.name.c_str(), "Heap"),
++                      TraceLoggingString(stats.type_names[i].c_str(), "Type"),
++                      TraceLoggingUInt64(type.object_count, "ObjectCount"),
++                      TraceLoggingUInt64(type.allocated_bytes,
++                                         "AllocatedBytes"))))
++            return;
++        }
++      }
++    }
++  }
++  PartitionDumper dumper(checkpoint);
++  partition_alloc::PartitionRoot::DumpAllStatsForTesting(&dumper);
++  if (!WriteSucceeded(args, dumper.error()))
++    return;
++  std::unique_ptr<v8::AllocationProfile> profile(
++      args->isolate()->GetHeapProfiler()->GetAllocationProfile());
++  if (!profile) {
++    args->ThrowTypeError("V8 allocation profile is unavailable.");
++    return;
++  }
++  std::vector<std::pair<v8::AllocationProfile::Node*, uint32_t>> nodes{
++      {profile->GetRootNode(), 0}};
++  while (!nodes.empty()) {
++    const auto [node, parent] = nodes.back();
++    nodes.pop_back();
++    v8::String::Utf8Value function(args->isolate(), node->name);
++    v8::String::Utf8Value script(args->isolate(), node->script_name);
++    if (!WriteSucceeded(
++            args,
++            TraceLoggingWrite(
++                g_memory_provider, "V8AllocationNode",
++                TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                TraceLoggingUInt32(node->node_id, "Node"),
++                TraceLoggingUInt32(parent, "Parent"),
++                TraceLoggingString(*function ? *function : "", "Function"),
++                TraceLoggingString(*script ? *script : "", "Script"),
++                TraceLoggingInt32(node->line_number, "Line"),
++                TraceLoggingInt32(node->column_number, "Column"))))
++      return;
++    for (auto* child : node->children)
++      nodes.emplace_back(child, node->node_id);
++  }
++  for (const auto& sample : profile->GetSamples()) {
++    if (!WriteSucceeded(
++            args,
++            TraceLoggingWrite(
++                g_memory_provider, "V8AllocationSample",
++                TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                TraceLoggingUInt64(sample.sample_id, "Sample"),
++                TraceLoggingUInt32(sample.node_id, "Node"),
++                TraceLoggingUInt64(sample.size, "ObjectBytes"),
++                TraceLoggingUInt64(sample.count, "EstimatedCount"),
++                TraceLoggingUInt64(sample.sample_interval, "SamplingInterval"),
++                TraceLoggingBool(sample.is_live, "Live"))))
++      return;
++  }
++  WriteSucceeded(
++      args, TraceLoggingWrite(g_memory_provider, "CheckpointEnd",
++                              TraceLoggingUInt64(checkpoint, "Checkpoint"),
++                              TraceLoggingUInt64(observer.failed_writes.load(),
++                                                 "FailedWrites")));
++}
++
++void StopProbe(gin::Arguments* args) {
++  base::AutoLock lock(Observer().control_lock);
++  if (Observer().owner != args->isolate()) {
++    args->ThrowTypeError("No memory probe is running on this isolate.");
++    return;
++  }
++  StopLocked(args->isolate());
++  if (Observer().failed_writes.load() != 0)
++    args->ThrowTypeError("Memory probe stopped with failed ETW event writes.");
++}
++
++class MemoryProbeRetentionFixture final
++    : public cppgc::GarbageCollected<MemoryProbeRetentionFixture> {
++ public:
++  void Trace(cppgc::Visitor*) const {}
++};
++
++cppgc::Persistent<MemoryProbeRetentionFixture>& RetentionFixture() {
++  static base::NoDestructor<cppgc::Persistent<MemoryProbeRetentionFixture>>
++      root;
++  return *root;
++}
++
++void SetRetentionFixture(gin::Arguments* args) {
++  bool retain;
++  if (!args->GetNext(&retain)) {
++    args->ThrowTypeError("Retention fixture needs a boolean.");
++    return;
++  }
++  base::AutoLock lock(Observer().control_lock);
++  if (Observer().owner != args->isolate() || !Observer().lifetime_started) {
++    args->ThrowTypeError("The fixture requires exact history on this isolate.");
++    return;
++  }
++  if (retain) {
++    if (RetentionFixture()) {
++      args->ThrowTypeError("Retention fixture is already rooted.");
++      return;
++    }
++    auto* heap = args->isolate()->GetCppHeap();
++    if (!heap) {
++      args->ThrowTypeError("No cppgc heap is attached.");
++      return;
++    }
++    RetentionFixture() =
++        cppgc::MakeGarbageCollected<MemoryProbeRetentionFixture>(
++            heap->GetAllocationHandle(), cppgc::AdditionalBytes(4096));
++  } else {
++    RetentionFixture().Clear();
++  }
++}
++
++}  // namespace
++
++void RegisterMemoryETWProbe(gin_helper::Dictionary* exports) {
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("memory-etw-probe"))
++    return;
++  auto& observer = Observer();
++  base::AutoLock lock(observer.control_lock);
++  if (!observer.installed) {
++    const ULONG result = TraceLoggingRegister(g_memory_provider);
++    observer.registration_error = result;
++    if (result == ERROR_SUCCESS) {
++      observer.installed = true;
++    } else {
++      LOG(ERROR) << "Memory ETW provider registration failed: " << result;
++    }
++  }
++  exports->SetMethod<&StartProbe>("startMemoryProbe");
++  exports->SetMethod<&Checkpoint>("memoryCheckpoint");
++  exports->SetMethod<&WorkloadMarker>("memoryMarker");
++  exports->SetMethod<&StopProbe>("stopMemoryProbe");
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "memory-probe-test-fixture"))
++    exports->SetMethod<&SetRetentionFixture>("setMemoryRetentionFixture");
++}
++
++}  // namespace electron

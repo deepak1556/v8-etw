@@ -1,0 +1,1001 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 192a01bd5f6be2b0d35a7a0cede7c4371729e5d8..e3a5d971bf530d2e008ad1ab28858c4ad3561d4d 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -6718,6 +6718,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
+     "src/utils/version.cc",
+     "src/zone/accounting-allocator.cc",
+     "src/zone/type-stats.cc",
++    "src/zone/zone-memory-trace.h",
+     "src/zone/zone-segment.cc",
+     "src/zone/zone.cc",
+     "third_party/siphash/halfsiphash.cc",
+@@ -8869,6 +8870,8 @@ v8_executable("d8") {
+     "src/d8/d8-console.cc",
+     "src/d8/d8-console.h",
+     "src/d8/d8-js.cc",
++    "src/d8/d8-memory-trace.cc",
++    "src/d8/d8-memory-trace.h",
+     "src/d8/d8-platforms.cc",
+     "src/d8/d8-platforms.h",
+     "src/d8/d8-test.cc",
+@@ -8897,6 +8900,7 @@ v8_executable("d8") {
+     ":v8_libplatform",
+     ":v8_simdutf",
+     ":v8_tracing",
++    "//base/allocator/partition_allocator/src/partition_alloc",
+     "//build/win:default_exe_manifest",
+   ]
+ 
+diff --git a/src/compiler/pipeline-statistics.cc b/src/compiler/pipeline-statistics.cc
+index dad3ac558b21dfc1497b7ade58897fa2e0013154..2361d07f0bf7b60e9c62f5c931ecc2ebb671410a 100644
+--- a/src/compiler/pipeline-statistics.cc
++++ b/src/compiler/pipeline-statistics.cc
+@@ -10,6 +10,7 @@
+ #include "src/compiler/turboshaft/phase.h"
+ #include "src/compiler/zone-stats.h"
+ #include "src/objects/shared-function-info.h"
++#include "src/zone/zone-memory-trace.h"
+ 
+ namespace v8 {
+ namespace internal {
+@@ -89,6 +90,10 @@ void PipelineStatisticsBase::EndPhaseKind(
+     CompilationStatistics::BasicStats* diff) {
+   DCHECK(!InPhase());
+   phase_kind_stats_.End(this, diff);
++  TraceZoneMemory(ZoneMemoryEvent::kPhaseStats, outer_zone_,
++                  outer_zone_->allocator(), nullptr,
++                  diff->total_allocated_bytes_, diff->max_allocated_bytes_,
++                  diff->absolute_max_allocated_bytes_, phase_kind_name_);
+   compilation_stats_->RecordPhaseKindStats(phase_kind_name_, *diff);
+ }
+ 
+@@ -101,6 +106,10 @@ void PipelineStatisticsBase::BeginPhase(const char* phase_name) {
+ void PipelineStatisticsBase::EndPhase(CompilationStatistics::BasicStats* diff) {
+   DCHECK(InPhaseKind());
+   phase_stats_.End(this, diff);
++  TraceZoneMemory(ZoneMemoryEvent::kPhaseStats, outer_zone_,
++                  outer_zone_->allocator(), nullptr,
++                  diff->total_allocated_bytes_, diff->max_allocated_bytes_,
++                  diff->absolute_max_allocated_bytes_, phase_name_);
+   compilation_stats_->RecordPhaseStats(phase_kind_name_, phase_name_, *diff);
+ }
+ 
+diff --git a/src/d8/d8-memory-trace.cc b/src/d8/d8-memory-trace.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d26661f02b2da7f578a1d11c3a76db96fb68934c
+--- /dev/null
++++ b/src/d8/d8-memory-trace.cc
+@@ -0,0 +1,276 @@
++#include "src/d8/d8-memory-trace.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++
++#include "partition_alloc/partition_root.h"
++#include "partition_alloc/partition_stats.h"
++#include "src/d8/d8.h"
++#include "src/execution/isolate.h"
++#include "src/flags/flags.h"
++#include "src/heap/heap-allocator.h"
++#include "src/heap/heap-inl.h"
++#include "src/heap/heap.h"
++#include "src/heap/main-allocator.h"
++#include "src/heap/memory-allocator.h"
++#include "src/heap/memory-pool.h"
++#include "src/heap/read-only-spaces.h"
++#include "src/heap/spaces.h"
++#include "src/zone/accounting-allocator.h"
++#include "src/zone/zone-memory-trace.h"
++
++#if V8_ENABLE_WEBASSEMBLY
++#include "src/wasm/wasm-code-manager.h"
++#include "src/wasm/wasm-engine-globals.h"
++#include "src/wasm/wasm-engine.h"
++#endif
++
++#if defined(V8_OS_WIN)
++#include <windows.h>
++// Process-memory declarations require Windows SDK types.
++#include <psapi.h>
++#endif
++
++namespace v8 {
++namespace {
++std::atomic<uint64_t> next_scope{0};
++std::atomic<uint64_t> next_snapshot{0};
++std::atomic<uint64_t> active_scopes{0};
++
++class PartitionMemoryDumper final
++    : public partition_alloc::PartitionStatsDumper {
++ public:
++  PartitionMemoryDumper(Isolate* isolate, uint64_t snapshot)
++      : isolate_(isolate), snapshot_(snapshot) {}
++  void PartitionDumpTotals(
++      const char* name,
++      const partition_alloc::PartitionMemoryStats* stats) override {
++    char label[128];
++    const auto emit = [&](const char* metric, size_t first, size_t second,
++                          size_t third) {
++      const int length =
++          snprintf(label, sizeof(label), "partition/%s/%s", name, metric);
++      CHECK_GT(length, 0);
++      CHECK_LT(static_cast<size_t>(length), sizeof(label));
++      i::TraceZoneMemory(i::ZoneMemoryEvent::kMemorySnapshot, isolate_, nullptr,
++                         reinterpret_cast<const void*>(snapshot_), first,
++                         second, third, label);
++    };
++    emit("totals", stats->total_committed_bytes, stats->total_active_bytes,
++         stats->total_mmapped_bytes);
++    emit("allocated", stats->total_allocated_bytes, stats->total_active_count,
++         stats->total_resident_bytes);
++    emit("reclaimable", stats->total_decommittable_bytes,
++         stats->total_discardable_bytes, stats->total_resident_bytes);
++  }
++  void PartitionsDumpBucketStats(
++      const char*,
++      const partition_alloc::PartitionBucketMemoryStats*) override {}
++
++ private:
++  Isolate* const isolate_;
++  uint64_t const snapshot_;
++};
++
++size_t LabTail(i::MainAllocator* allocator) {
++  const auto& area = allocator->allocation_info();
++  const auto end =
++      std::max(area.limit(), allocator->extended_limit_for_tracing());
++  CHECK_GE(end, area.top());
++  return end - area.top();
++}
++}  // namespace
++
++ProcessMemorySampler::ProcessMemorySampler(Isolate* isolate)
++    : isolate_(isolate), scope_id_(++next_scope) {
++#if !defined(V8_OS_WIN)
++  FATAL("Process-memory ETW sampling requires Windows.");
++#endif
++  ++active_scopes;
++  isolate_->AddGCPrologueCallback(GCBefore);
++  isolate_->AddGCEpilogueCallback(GCAfter);
++  Capture("isolate-start");
++  thread_ = std::thread([this] { Run(); });
++}
++
++ProcessMemorySampler::~ProcessMemorySampler() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    stopped_ = true;
++  }
++  wake_.notify_one();
++  thread_.join();
++  isolate_->RemoveGCPrologueCallback(GCBefore);
++  isolate_->RemoveGCEpilogueCallback(GCAfter);
++  Capture("isolate-end");
++  --active_scopes;
++}
++
++void ProcessMemorySampler::Run() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  constexpr auto interval = std::chrono::milliseconds(20);
++  while (!wake_.wait_for(lock, interval, [this] { return stopped_; })) {
++    if (!pending_.exchange(true)) {
++      ++requested_;
++      // No borrowed sampler pointer escapes into a queued callback.
++      isolate_->RequestInterrupt(Interrupt, nullptr);
++    }
++  }
++}
++
++void ProcessMemorySampler::Interrupt(Isolate* isolate, void*) {
++  auto* data = PerIsolateData::Get(isolate);
++  if (!data || !data->memory_sampler()) return;
++  auto* sampler = data->memory_sampler();
++  ++sampler->delivered_;
++  sampler->Capture("periodic");
++  sampler->pending_ = false;
++}
++
++void ProcessMemorySampler::GCBefore(Isolate* isolate, GCType type,
++                                    GCCallbackFlags, void*) {
++  auto* data = PerIsolateData::Get(isolate);
++  if (data && data->memory_sampler()) {
++    data->memory_sampler()->Capture("gc-before", type);
++  }
++}
++
++void ProcessMemorySampler::GCAfter(Isolate* isolate, GCType type,
++                                   GCCallbackFlags, void*) {
++  auto* data = PerIsolateData::Get(isolate);
++  if (data && data->memory_sampler()) {
++    data->memory_sampler()->Capture("gc-after", type);
++  }
++}
++
++void ProcessMemorySampler::Capture(const char* reason, GCType type) {
++#if defined(V8_OS_WIN)
++  const uint64_t snapshot = ++next_snapshot;
++  const auto started = std::chrono::steady_clock::now();
++  const auto emit = [&](const char* name, uint64_t first, uint64_t second,
++                        uint64_t third) {
++    i::TraceZoneMemory(i::ZoneMemoryEvent::kMemorySnapshot, isolate_, nullptr,
++                       reinterpret_cast<const void*>(snapshot), first, second,
++                       third, name);
++  };
++  auto* isolate = reinterpret_cast<i::Isolate*>(isolate_);
++  auto* heap = isolate->heap();
++  auto* allocator = heap->allocator();
++  std::array<i::MainAllocator*, 4> labs = {
++      allocator->old_space_allocator(), allocator->code_space_allocator(),
++      allocator->trusted_space_allocator(),
++      heap->new_space() || i::v8_flags.sticky_mark_bits
++          ? allocator->new_space_allocator()
++          : nullptr};
++  std::array<std::pair<i::Address, i::Address>, 4> lab_bounds{};
++  for (size_t index = 0; index < labs.size(); ++index) {
++    if (labs[index]) {
++      const auto& area = labs[index]->allocation_info();
++      lab_bounds[index] = {area.top(), area.limit()};
++    }
++  }
++  char label[96];
++  snprintf(label, sizeof(label), "snapshot-begin/%s", reason);
++  emit(label, scope_id_, heap->gc_count().value(), static_cast<uint64_t>(type));
++  emit("sampling", requested_.load(), delivered_, active_scopes.load());
++
++  PROCESS_MEMORY_COUNTERS_EX process{};
++  process.cb = sizeof(process);
++  CHECK(GetProcessMemoryInfo(
++      GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process),
++      sizeof(process)));
++  emit("process", process.PrivateUsage, process.WorkingSetSize,
++       process.PeakWorkingSetSize);
++
++  // Public heap statistics APIs retire LABs; these reads deliberately do not.
++  const size_t used = heap->SizeOfObjects();
++  const size_t physical = heap->CommittedPhysicalMemory();
++  const size_t committed = heap->CommittedMemory();
++  emit("heap", committed, used, physical);
++  emit("heap-external", heap->external_memory(), heap->backing_store_bytes(),
++       0);
++  emit("heap-aux", heap->CommittedMemoryExecutable(),
++       heap->TotalGlobalHandlesSize(), heap->UsedGlobalHandlesSize());
++  emit("contexts", heap->NumberOfNativeContexts(),
++       heap->NumberOfDetachedContexts(), 0);
++  emit("compiler-arena", isolate->allocator()->GetCurrentMemoryUsage(),
++       isolate->allocator()->GetMaxMemoryUsage(), 0);
++  auto* memory_pool = heap->memory_allocator()->memory_pool_for_tracing();
++  if (memory_pool) {
++    const auto pool = memory_pool->GetBackingStatsForTracing();
++    emit("v8-page-pool", pool.normal_bytes, pool.large_bytes, pool.zone_bytes);
++    emit("v8-page-pool-commit", pool.normal_committed_bytes,
++         pool.normal_bytes - pool.normal_committed_bytes, 0);
++  }
++  PartitionMemoryDumper partitions(isolate_, snapshot);
++  partition_alloc::PartitionRoot::DumpAllStatsForTesting(&partitions);
++
++  for (int id = i::FIRST_SPACE; id <= i::LAST_SPACE; ++id) {
++    if (id == i::RO_SPACE) continue;
++    auto* space = heap->space(id);
++    if (!space) continue;
++    const size_t space_used = space->SizeOfObjects();
++    const size_t space_physical = space->CommittedPhysicalMemory();
++    const size_t space_committed = space->CommittedMemory();
++    snprintf(label, sizeof(label), "space/%s",
++             i::ToString(static_cast<i::AllocationSpace>(id)));
++    emit(label, space_committed, space_used, space_physical);
++    snprintf(label, sizeof(label), "available/%s",
++             i::ToString(static_cast<i::AllocationSpace>(id)));
++    emit(label, space->Available(), 0, 0);
++  }
++  auto* ro = heap->read_only_space();
++  emit("shared-read-only", ro->CommittedMemory(), ro->Size(),
++       ro->CommittedPhysicalMemory());
++  emit("lab/old", LabTail(allocator->old_space_allocator()), 0, 0);
++  emit("lab/code", LabTail(allocator->code_space_allocator()), 0, 0);
++  emit("lab/trusted", LabTail(allocator->trusted_space_allocator()), 0, 0);
++  if (heap->new_space() || i::v8_flags.sticky_mark_bits) {
++    emit("lab/new", LabTail(allocator->new_space_allocator()), 0, 0);
++  }
++
++#if V8_ENABLE_WEBASSEMBLY
++  emit("wasm-process", i::wasm::GetWasmCodeManager()->committed_code_space(),
++       i::wasm::GetWasmEngine()->allocator()->GetCurrentMemoryUsage(), 0);
++#endif
++
++  std::array<HANDLE, 256> handles{};
++  const DWORD count =
++      GetProcessHeaps(static_cast<DWORD>(handles.size()), handles.data());
++  size_t allocated = 0, backing = 0, reserved = 0, failures = 0;
++  if (count == 0 || count > handles.size()) {
++    emit("windows-heap-error", GetLastError(), count, 0);
++    ++failures;
++  } else {
++    for (DWORD index = 0; index < count; ++index) {
++      HEAP_SUMMARY summary{};
++      summary.cb = sizeof(summary);
++      if (!HeapSummary(handles[index], 0, &summary)) {
++        emit("windows-heap-error", GetLastError(), index, 0);
++        ++failures;
++        continue;
++      }
++      allocated += summary.cbAllocated;
++      backing += summary.cbCommitted;
++      reserved += summary.cbReserved;
++    }
++  }
++  emit("windows-heaps", backing, allocated, reserved);
++  emit("windows-heap-coverage", count, failures, 0);
++  for (size_t index = 0; index < labs.size(); ++index) {
++    if (labs[index]) {
++      CHECK_EQ(lab_bounds[index].first, labs[index]->allocation_info().top());
++      CHECK_EQ(lab_bounds[index].second,
++               labs[index]->allocation_info().limit());
++    }
++  }
++  const uint64_t duration =
++      std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now() - started)
++          .count();
++  emit("snapshot-end", duration, 0, 0);
++#endif
++}
++}  // namespace v8
+diff --git a/src/d8/d8-memory-trace.h b/src/d8/d8-memory-trace.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2be24f1073acc47f63d89554b24422ab17890f40
+--- /dev/null
++++ b/src/d8/d8-memory-trace.h
+@@ -0,0 +1,41 @@
++#ifndef V8_D8_D8_MEMORY_TRACE_H_
++#define V8_D8_D8_MEMORY_TRACE_H_
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
++#include <thread>
++
++#include "include/v8-isolate.h"
++
++namespace v8 {
++
++class ProcessMemorySampler {
++ public:
++  explicit ProcessMemorySampler(Isolate* isolate);
++  ~ProcessMemorySampler();
++  ProcessMemorySampler(const ProcessMemorySampler&) = delete;
++  ProcessMemorySampler& operator=(const ProcessMemorySampler&) = delete;
++
++  void Capture(const char* reason, GCType type = kGCTypeAll);
++
++ private:
++  static void Interrupt(Isolate* isolate, void*);
++  static void GCBefore(Isolate* isolate, GCType type, GCCallbackFlags, void*);
++  static void GCAfter(Isolate* isolate, GCType type, GCCallbackFlags, void*);
++  void Run();
++
++  Isolate* const isolate_;
++  uint64_t const scope_id_;
++  std::mutex mutex_;
++  std::condition_variable wake_;
++  bool stopped_ = false;
++  std::atomic<bool> pending_{false};
++  std::atomic<uint64_t> requested_{0};
++  uint64_t delivered_ = 0;
++  std::thread thread_;
++};
++
++}  // namespace v8
++#endif  // V8_D8_D8_MEMORY_TRACE_H_
+diff --git a/src/d8/d8.cc b/src/d8/d8.cc
+index 8d325f418e3881cba0072befbfddec7f545b12ed..47f442dcf21c90ae5ec60ac3805a7a8be69dfd63 100644
+--- a/src/d8/d8.cc
++++ b/src/d8/d8.cc
+@@ -59,6 +59,7 @@
+ #include "src/codegen/compiler.h"
+ #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
+ #include "src/d8/d8-console.h"
++#include "src/d8/d8-memory-trace.h"
+ #include "src/d8/d8-platforms.h"
+ #include "src/d8/d8.h"
+ #include "src/debug/debug-interface.h"
+@@ -90,6 +91,7 @@
+ #include "src/tracing/perfetto-sdk.h"
+ #include "src/utils/ostreams.h"
+ #include "src/utils/utils.h"
++#include "src/zone/zone-memory-trace.h"
+ 
+ #ifdef V8_OS_DARWIN
+ #include <mach/mach.h>
+@@ -2364,6 +2366,9 @@ bool Shell::LoadJSON(Isolate* isolate, const char* file_name) {
+ 
+ PerIsolateData::PerIsolateData(Isolate* isolate) : isolate_(isolate) {
+   isolate->SetData(0, this);
++  if (i::v8_flags.trace_process_memory_etw) {
++    memory_sampler_ = std::make_unique<ProcessMemorySampler>(isolate);
++  }
+   if (i::v8_flags.expose_async_hooks) {
+     async_hooks_wrapper_ = new AsyncHooks(isolate);
+   }
+@@ -2372,6 +2377,7 @@ PerIsolateData::PerIsolateData(Isolate* isolate) : isolate_(isolate) {
+ 
+ PerIsolateData::~PerIsolateData() {
+   isolate_->SetData(0, nullptr);  // Not really needed, just to be sure...
++  memory_sampler_.reset();
+   if (i::v8_flags.expose_async_hooks) {
+     delete async_hooks_wrapper_;  // This uses the isolate
+   }
+@@ -4951,8 +4957,31 @@ Local<ObjectTemplate> Shell::CreateRealmTemplate(Isolate* isolate) {
+   return realm_template;
+ }
+ 
++void ZoneMemoryMarker(const FunctionCallbackInfo<Value>& info) {
++  Isolate* isolate = info.GetIsolate();
++  if (info.Length() != 2 || !info[0]->IsString() || !info[1]->IsBoolean()) {
++    isolate->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(
++        isolate, "Zone marker requires name and begin boolean")));
++    return;
++  }
++  String::Utf8Value name(isolate, info[0]);
++  if (!*name || name.length() > 256) {
++    isolate->ThrowException(Exception::TypeError(
++        String::NewFromUtf8Literal(isolate, "Invalid Zone benchmark name")));
++    return;
++  }
++  auto* sampler = PerIsolateData::Get(isolate)->memory_sampler();
++  const bool begin = info[1]->BooleanValue(isolate);
++  if (sampler && !begin) sampler->Capture("benchmark-end");
++  i::TraceZoneMemory(i::ZoneMemoryEvent::kBenchmark, isolate, nullptr, nullptr,
++                     0, info[1]->BooleanValue(isolate) ? 1 : 2, 0, *name);
++  if (sampler && begin) sampler->Capture("benchmark-begin");
++}
++
+ Local<ObjectTemplate> Shell::CreateD8Template(Isolate* isolate) {
+   Local<ObjectTemplate> d8_template = ObjectTemplate::New(isolate);
++  d8_template->Set(isolate, "zoneMemoryMarker",
++                   FunctionTemplate::New(isolate, ZoneMemoryMarker));
+   {
+     Local<ObjectTemplate> file_template = ObjectTemplate::New(isolate);
+     file_template->Set(isolate, "read",
+diff --git a/src/d8/d8.h b/src/d8/d8.h
+index eae46fa9d05c4417a52d72233e6bd18f9266b3ae..6ce73aed4f0b76af2e43945ef003678724caab3f 100644
+--- a/src/d8/d8.h
++++ b/src/d8/d8.h
+@@ -37,6 +37,8 @@
+ 
+ namespace v8 {
+ 
++class ProcessMemorySampler;
++
+ template <int N>
+ inline Local<Value> ThrowError(Isolate* isolate, const char (&message)[N]) {
+   if (isolate->IsExecutionTerminating()) return v8::Undefined(isolate);
+@@ -416,6 +418,7 @@ class PerIsolateData {
+   };
+ 
+   AsyncHooks* GetAsyncHooks() { return async_hooks_wrapper_; }
++  ProcessMemorySampler* memory_sampler() { return memory_sampler_.get(); }
+ 
+   void RemoveUnhandledPromise(Local<Promise> promise);
+   void AddUnhandledPromise(Local<Promise> promise, Local<Message> message,
+@@ -447,6 +450,7 @@ class PerIsolateData {
+   friend class Shell;
+   friend class RealmScope;
+   Isolate* isolate_;
++  std::unique_ptr<ProcessMemorySampler> memory_sampler_;
+   int realm_current_;
+   int realm_switch_;
+   std::vector<Realm> realms_;
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index 528cf0e9c059e9be7c000eb4c655961311d79c8f..851d83e784b6c48fe7f9b35bdd70ff8a5876f348 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -2621,6 +2621,10 @@ DEFINE_DEVELOPER_FLAG(track_gc_object_stats,
+ DEFINE_DEVELOPER_FLAG(trace_gc_object_stats,
+                       "trace object counts and memory usage")
+ DEFINE_DEVELOPER_FLAG(trace_zone_stats, "trace zone memory usage")
++DEFINE_BOOL(trace_zone_etw, false,
++            "emit diagnostic Windows ETW zone capacity/lifetime events")
++DEFINE_BOOL(trace_process_memory_etw, false,
++            "sample diagnostic Windows process/heap composition through ETW")
+ DEFINE_GENERIC_IMPLICATION(
+     trace_zone_stats,
+     TracingFlags::zone_stats.store(
+diff --git a/src/heap/main-allocator.h b/src/heap/main-allocator.h
+index f45303df412afe69d3ba6efbb4f7f165e23218d2..d9a9d4ce6ea6b97592333d4c8b119b6aa6ba0123 100644
+--- a/src/heap/main-allocator.h
++++ b/src/heap/main-allocator.h
+@@ -180,6 +180,7 @@ class MainAllocator {
+   const LinearAllocationArea& allocation_info() const {
+     return *allocation_info_;
+   }
++  Address extended_limit_for_tracing() const { return extended_limit_; }
+ 
+   AllocationCounter& allocation_counter() {
+     return allocation_counter_.value();
+diff --git a/src/heap/memory-allocator.h b/src/heap/memory-allocator.h
+index ee492b08c3e7001e145c6706982d9cae73812411..8e2b5f9ea3ffb863e7ca5cda3f1a6f891fc3189c 100644
+--- a/src/heap/memory-allocator.h
++++ b/src/heap/memory-allocator.h
+@@ -222,6 +222,7 @@ class MemoryAllocator final {
+   // Returns the number of total cached chunks (including cached pages of other
+   // isolates).
+   V8_EXPORT_PRIVATE size_t GetTotalPooledChunksCount();
++  MemoryPool* memory_pool_for_tracing() const { return pool_; }
+ 
+   // Releases all pooled chunks for this isolate immediately.
+   V8_EXPORT_PRIVATE void ReleasePooledChunksImmediately();
+diff --git a/src/heap/memory-pool.cc b/src/heap/memory-pool.cc
+index aa8cc8050983f55bb5c4aff84e16698e81d96561..38860e63b47738ff09cfe007ddb93af51d5e8d80 100644
+--- a/src/heap/memory-pool.cc
++++ b/src/heap/memory-pool.cc
+@@ -195,6 +195,17 @@ size_t MemoryPool::PoolImpl<PoolEntry>::LocalSize(Isolate* isolate) const {
+   return (it != local_pools_.end()) ? it->second.size() : 0;
+ }
+ 
++template <typename PoolEntry>
++size_t MemoryPool::PoolImpl<PoolEntry>::BackingSizeForTracing() const {
++  base::MutexGuard guard(&mutex_);
++  size_t bytes = 0;
++  for (const auto& [isolate, entries] : local_pools_) {
++    for (const auto& entry : entries) bytes += entry.size();
++  }
++  for (const auto& entry : shared_pool_) bytes += entry.size();
++  return bytes;
++}
++
+ template <typename PoolEntry>
+ size_t MemoryPool::PoolImpl<PoolEntry>::SharedSize() const {
+   base::MutexGuard guard(&mutex_);
+@@ -334,6 +345,11 @@ size_t MemoryPool::LargePagePoolImpl::ComputeTotalSize() const {
+ 
+ void MemoryPool::LargePagePoolImpl::TearDown() { CHECK(pages_.empty()); }
+ 
++size_t MemoryPool::LargePagePoolImpl::BackingSizeForTracing() {
++  base::MutexGuard guard(&mutex_);
++  return total_size_;
++}
++
+ PooledPage MemoryPool::CreatePooledPage(NormalPage* metadata) {
+   return PooledPage::Create(metadata,
+                             current_epoch_.load(std::memory_order_relaxed));
+@@ -403,6 +419,12 @@ size_t MemoryPool::GetSharedCount() const { return page_pool_.SharedSize(); }
+ 
+ size_t MemoryPool::GetTotalCount() const { return page_pool_.Size(); }
+ 
++MemoryPool::BackingStatsForTracing MemoryPool::GetBackingStatsForTracing() {
++  const size_t normal = page_pool_.BackingSizeForTracing();
++  return {normal, large_pool_.BackingSizeForTracing(),
++          zone_pool_.BackingSizeForTracing(), normal};
++}
++
+ void MemoryPool::Add(Isolate* isolate, MutablePage* page) {
+   DCHECK_NOT_NULL(isolate);
+   page_pool_.PutLocal(
+diff --git a/src/heap/memory-pool.h b/src/heap/memory-pool.h
+index 89a46091506037376e671ec88f5556fbb24e3ae5..593afce7c2de14b86d316d4d85dbf96dd7860a7e 100644
+--- a/src/heap/memory-pool.h
++++ b/src/heap/memory-pool.h
+@@ -145,6 +145,13 @@ class MemoryPool final {
+ 
+   // Returns the number of pages cached in all local pools and the shared pool.
+   size_t GetTotalCount() const;
++  struct BackingStatsForTracing {
++    size_t normal_bytes;
++    size_t large_bytes;
++    size_t zone_bytes;
++    size_t normal_committed_bytes;
++  };
++  BackingStatsForTracing GetBackingStatsForTracing();
+ 
+   // Cancels the background releasing task.
+   V8_EXPORT_PRIVATE void CancelAndWaitForTaskToFinishForTesting();
+@@ -181,6 +188,7 @@ class MemoryPool final {
+     size_t Size() const;
+     size_t LocalSize(Isolate* isolate) const;
+     size_t SharedSize() const;
++    size_t BackingSizeForTracing() const;
+ 
+    private:
+     const MemoryPool::Config config_;
+@@ -203,6 +211,7 @@ class MemoryPool final {
+ 
+     void TearDown();
+     size_t ComputeTotalSize() const;
++    size_t BackingSizeForTracing();
+ 
+    private:
+     const MemoryPool::Config config_;
+diff --git a/src/maglev/maglev-compiler.cc b/src/maglev/maglev-compiler.cc
+index 06dd7c5e3010c84203a4cf4ffce906eeb8e51f83..350589dbf7fd262aad71ca0a71e55ece78148e0b 100644
+--- a/src/maglev/maglev-compiler.cc
++++ b/src/maglev/maglev-compiler.cc
+@@ -40,6 +40,7 @@
+ #include "src/maglev/maglev-truncation.h"
+ #include "src/objects/code-inl.h"
+ #include "src/objects/js-function.h"
++#include "src/zone/zone-memory-trace.h"
+ 
+ #ifdef ALWAYS_MAGLEV_GRAPH_LABELLER
+ #define ALWAYS_MAGLEV_GRAPH_LABELLER_BOOL true
+@@ -160,6 +161,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.GraphBuilding");
+       SYNCHRONIZATION_POINT("MaglevGraphBuilding");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.GraphBuilding");
+       MaglevGraphBuilder graph_builder(
+           local_isolate, compilation_info->toplevel_compilation_unit(), graph);
+       if (!graph_builder.Build()) return false;
+@@ -171,6 +174,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.Inlining");
+       SYNCHRONIZATION_POINT("MaglevInlining");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.Inlining");
+       MaglevInliner inliner(graph);
+       if (!inliner.Run()) return false;
+       PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+@@ -181,6 +186,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.Truncation");
+       SYNCHRONIZATION_POINT("MaglevTruncation");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.Truncation");
+       GraphBackwardProcessor<PropagateTruncationProcessor> propagate(graph);
+       propagate.ProcessGraph(graph);
+       PrintGraph(graph, v8_flags.print_maglev_graphs,
+@@ -195,6 +202,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.LoopOptimizations");
+       SYNCHRONIZATION_POINT("MaglevLoopOptimizations");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.LoopOptimizations");
+       GraphProcessor<LoopOptimizationProcessor> loop_optimizations(
+           compilation_info);
+       loop_optimizations.ProcessGraph(graph);
+@@ -253,6 +262,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.NodeProcessing");
+       SYNCHRONIZATION_POINT("MaglevNodeProcessing");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.NodeProcessing");
+       compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
+       GraphMultiProcessor<DeadNodeSweepingProcessor,
+                           ValueLocationConstraintProcessor,
+@@ -269,6 +280,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+       TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                   "V8.Maglev.RegisterAllocation");
+       SYNCHRONIZATION_POINT("MaglevRegisterAllocation");
++      ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                        "Maglev.RegisterAllocation");
+       StraightForwardRegisterAllocator allocator(compilation_info, graph,
+                                                  &regalloc_info);
+       PrintGraph(graph, v8_flags.print_maglev_graph, MaglevPhase::kRegAlloc);
+@@ -294,6 +307,8 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
+     TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                 "V8.Maglev.CodeAssembly");
+     SYNCHRONIZATION_POINT("MaglevCodeAssembly");
++    ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                      "Maglev.CodeAssembly");
+     compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
+     std::unique_ptr<MaglevCodeGenerator> code_generator =
+         std::make_unique<MaglevCodeGenerator>(local_isolate, compilation_info,
+@@ -327,6 +342,8 @@ std::pair<MaybeHandle<Code>, BailoutReason> MaglevCompiler::GenerateCode(
+     TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                 "V8.Maglev.CodeGeneration");
+     SYNCHRONIZATION_POINT("MaglevCodeGeneration");
++    ZoneMemoryPhaseScope memory_phase(compilation_info->zone(),
++                                      "Maglev.CodeGeneration");
+     if (compilation_info->is_detached() ||
+         !code_generator->Generate(isolate).ToHandle(&code)) {
+       compilation_info->toplevel_compilation_unit()
+diff --git a/src/zone/accounting-allocator.cc b/src/zone/accounting-allocator.cc
+index 08f4215eed73d049eb157233409a2d1e53857088..7e3d8254e992d5bf71cc6cc6d6402585c6740460 100644
+--- a/src/zone/accounting-allocator.cc
++++ b/src/zone/accounting-allocator.cc
+@@ -11,13 +11,44 @@
+ #include "src/heap/memory-pool.h"
+ #include "src/tracing/tracing-category-observer.h"
+ #include "src/utils/allocation.h"
++#include "src/zone/zone-memory-trace.h"
+ #include "src/zone/zone-segment.h"
+ 
++#if defined(V8_OS_WIN)
++#include <windows.h>
++
++// ETW declarations require the Windows SDK types.
++#include <evntprov.h>
++
++#include <mutex>
++#endif
++
+ namespace v8 {
+ namespace internal {
+ 
+ namespace {
+ 
++#if defined(V8_OS_WIN)
++constexpr GUID kZoneMemoryGuid = {
++    0x76ec13f3,
++    0x59c1,
++    0x4527,
++    {0xa5, 0x13, 0x64, 0x53, 0x02, 0x4c, 0xab, 0x81}};
++struct ZoneMemoryProvider {
++  std::mutex mutex;
++  REGHANDLE handle = 0;
++  uint64_t sequence = 0;
++  uint64_t failed_writes = 0;
++  ZoneMemoryProvider() {
++    ULONG error = EventRegister(&kZoneMemoryGuid, nullptr, nullptr, &handle);
++    if (error != ERROR_SUCCESS) {
++      failed_writes++;
++      PrintF("Zone ETW registration failed: %lu\n", error);
++    }
++  }
++};
++#endif
++
+ class ManagedZones final {
+  public:
+   static std::optional<VirtualMemory> GetOrCreateMemoryForSegment(
+@@ -103,12 +134,73 @@ class ManagedZones final {
+ 
+ }  // namespace
+ 
++void TraceZoneMemory(ZoneMemoryEvent kind, const void* zone,
++                     const void* allocator, const void* segment,
++                     size_t capacity, size_t used, size_t requested,
++                     const char* name) {
++#if defined(V8_OS_WIN)
++  if (!v8_flags.trace_zone_etw && !(v8_flags.trace_process_memory_etw &&
++                                    (kind == ZoneMemoryEvent::kMemorySnapshot ||
++                                     kind == ZoneMemoryEvent::kPoolOperation ||
++                                     kind == ZoneMemoryEvent::kBenchmark))) {
++    return;
++  }
++  static ZoneMemoryProvider* provider = new ZoneMemoryProvider;
++  if (!provider->handle || !EventProviderEnabled(provider->handle, 5, 1))
++    return;
++  std::lock_guard<std::mutex> guard(provider->mutex);
++  struct Record {
++    uint64_t version, sequence, kind, zone, allocator, segment;
++    uint64_t capacity, used, requested, managed, failed_writes, stack_depth;
++    uint64_t frames[24];
++  } record{};
++  record.version = 1;
++  record.sequence = ++provider->sequence;
++  record.kind = static_cast<uint64_t>(kind);
++  record.zone = reinterpret_cast<uintptr_t>(zone);
++  record.allocator = reinterpret_cast<uintptr_t>(allocator);
++  record.segment = reinterpret_cast<uintptr_t>(segment);
++  record.capacity = capacity;
++  record.used = used;
++  record.requested = requested;
++  record.managed =
++      allocator && static_cast<const AccountingAllocator*>(allocator)
++                       ->UsesManagedMemoryForTracing();
++  record.failed_writes = provider->failed_writes;
++  if (kind == ZoneMemoryEvent::kSegmentAdded) {
++    void* frames[24];
++    record.stack_depth = CaptureStackBackTrace(1, 24, frames, nullptr);
++    for (size_t i = 0; i < record.stack_depth; ++i)
++      record.frames[i] = reinterpret_cast<uintptr_t>(frames[i]);
++  }
++  const char* label = name ? name : "";
++  EVENT_DATA_DESCRIPTOR data[2];
++  EventDataDescCreate(&data[0], &record, sizeof(record));
++  EventDataDescCreate(&data[1], label, static_cast<ULONG>(strlen(label) + 1));
++  const EVENT_DESCRIPTOR descriptor{1, 0, 0, 5, 0, 0, 1};
++  const ULONG error = EventWrite(provider->handle, &descriptor, 2, data);
++  if (error != ERROR_SUCCESS) {
++    provider->failed_writes++;
++    PrintF("Zone ETW write failed: %lu\n", error);
++  }
++#endif
++}
++
+ AccountingAllocator::AccountingAllocator() : AccountingAllocator(nullptr) {}
+ 
+ AccountingAllocator::AccountingAllocator(Isolate* isolate)
+     : isolate_(isolate) {}
+ 
+-AccountingAllocator::~AccountingAllocator() = default;
++AccountingAllocator::~AccountingAllocator() {
++  TraceZoneMemory(ZoneMemoryEvent::kAllocatorDestroyed, nullptr, this, nullptr,
++                  GetCurrentMemoryUsage(), 0, 0, nullptr);
++}
++
++bool AccountingAllocator::UsesManagedMemoryForTracing() const {
++  return v8_flags.managed_zone_memory &&
++         (isolate_ ||
++          v8_flags.managed_zone_memory_for_isolate_independent_memory);
++}
+ 
+ Segment* AccountingAllocator::AllocateSegment(size_t requested_bytes) {
+   base::AllocationResult<void*> memory;
+@@ -137,6 +229,8 @@ Segment* AccountingAllocator::AllocateSegment(size_t requested_bytes) {
+ }
+ 
+ void AccountingAllocator::ReturnSegment(Segment* segment) {
++  TraceZoneMemory(ZoneMemoryEvent::kSegmentReturned, segment->zone(), this,
++                  segment, segment->total_size(), 0, 0, nullptr);
+   segment->ZapContents();
+   size_t segment_size = segment->total_size();
+   current_memory_usage_.fetch_sub(segment_size, std::memory_order_relaxed);
+diff --git a/src/zone/accounting-allocator.h b/src/zone/accounting-allocator.h
+index ce21b7770a851e9734ffda1ea9c2035475ece3eb..1aa96137d4ce7f259ee15716ef8ee5be72cad0d8 100644
+--- a/src/zone/accounting-allocator.h
++++ b/src/zone/accounting-allocator.h
+@@ -11,6 +11,7 @@
+ #include "src/base/macros.h"
+ #include "src/base/platform/mutex.h"
+ #include "src/logging/tracing-flags.h"
++#include "src/zone/type-stats.h"
+ 
+ namespace v8 {
+ 
+@@ -52,6 +53,7 @@ class V8_EXPORT_PRIVATE AccountingAllocator {
+   size_t GetMaxMemoryUsage() const {
+     return max_memory_usage_.load(std::memory_order_relaxed);
+   }
++  bool UsesManagedMemoryForTracing() const;
+ 
+   void TraceZoneCreation(const Zone* zone) {
+     if (V8_LIKELY(!TracingFlags::is_zone_stats_enabled())) return;
+diff --git a/src/zone/zone-memory-trace.h b/src/zone/zone-memory-trace.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..407509c4e633b236748def82e70a0f9a049cb04a
+--- /dev/null
++++ b/src/zone/zone-memory-trace.h
+@@ -0,0 +1,42 @@
++#ifndef V8_ZONE_ZONE_MEMORY_TRACE_H_
++#define V8_ZONE_ZONE_MEMORY_TRACE_H_
++
++#include <cstddef>
++#include <cstdint>
++
++namespace v8::internal {
++class Zone;
++enum class ZoneMemoryEvent : uint64_t {
++  kCreated = 1,
++  kSegmentAdded,
++  kSegmentReturned,
++  kClear,
++  kReset,
++  kRestore,
++  kDestroyed,
++  kAllocatorDestroyed,
++  kPoint,
++  kBenchmark,
++  // Value 11 is reserved for historical per-type records.
++  kPhaseStats = 12,
++  kMemorySnapshot,
++  kPoolOperation,
++};
++void TraceZoneMemory(ZoneMemoryEvent kind, const void* zone,
++                     const void* allocator, const void* segment,
++                     size_t capacity, size_t used, size_t requested,
++                     const char* name);
++
++class ZoneMemoryPhaseScope {
++ public:
++  ZoneMemoryPhaseScope(Zone* zone, const char* name);
++  ~ZoneMemoryPhaseScope();
++  ZoneMemoryPhaseScope(const ZoneMemoryPhaseScope&) = delete;
++  ZoneMemoryPhaseScope& operator=(const ZoneMemoryPhaseScope&) = delete;
++
++ private:
++  Zone* const zone_;
++  const char* const name_;
++};
++}  // namespace v8::internal
++#endif  // V8_ZONE_ZONE_MEMORY_TRACE_H_
+diff --git a/src/zone/zone.cc b/src/zone/zone.cc
+index 20c3f63741da6964e34e75729eb4b256d208854d..1ea6b2a98abbcd03ace628b38b3c2096070ba272 100644
+--- a/src/zone/zone.cc
++++ b/src/zone/zone.cc
+@@ -8,9 +8,11 @@
+ #include <memory>
+ 
+ #include "src/base/sanitizer/asan.h"
++#include "src/flags/flags.h"
+ #include "src/init/v8.h"
+ #include "src/utils/utils.h"
+ #include "src/zone/type-stats.h"
++#include "src/zone/zone-memory-trace.h"
+ 
+ namespace v8 {
+ namespace internal {
+@@ -32,13 +34,32 @@ constexpr size_t kASanRedzoneBytes = 0;
+ Zone::Zone(AccountingAllocator* allocator, const char* name)
+     : allocator_(allocator), name_(name) {
+   allocator_->TraceZoneCreation(this);
++  TraceZoneMemory(ZoneMemoryEvent::kCreated, this, allocator_, nullptr, 0, 0, 0,
++                  name_);
+ }
+ 
+ Zone::~Zone() {
++  TraceZoneMemory(ZoneMemoryEvent::kDestroyed, this, allocator_, nullptr,
++                  segment_bytes_allocated(), allocation_size(), 0, name_);
+   DeleteAll();
+   DCHECK_EQ(segment_bytes_allocated_.load(), 0);
+ }
+ 
++ZoneMemoryPhaseScope::ZoneMemoryPhaseScope(Zone* zone, const char* name)
++    : zone_(zone), name_(name) {
++  if (!v8_flags.trace_zone_etw) return;
++  TraceZoneMemory(ZoneMemoryEvent::kPoint, zone_, zone_->allocator(), nullptr,
++                  zone_->segment_bytes_allocated(), zone_->allocation_size(), 1,
++                  name_);
++}
++
++ZoneMemoryPhaseScope::~ZoneMemoryPhaseScope() {
++  if (!v8_flags.trace_zone_etw) return;
++  TraceZoneMemory(ZoneMemoryEvent::kPoint, zone_, zone_->allocator(), nullptr,
++                  zone_->segment_bytes_allocated(), zone_->allocation_size(), 2,
++                  name_);
++}
++
+ void* Zone::AsanNew(size_t size) {
+   CHECK(!sealed_);
+ 
+@@ -68,6 +89,8 @@ void* Zone::AsanNew(size_t size) {
+ 
+ void Zone::Reset() {
+   if (!segment_head_) return;
++  TraceZoneMemory(ZoneMemoryEvent::kPoint, this, allocator_, nullptr,
++                  segment_bytes_allocated(), allocation_size(), 0, name_);
+   Segment* keep = segment_head_;
+   segment_head_ = segment_head_->next();
+   if (segment_head_ != nullptr) {
+@@ -90,6 +113,8 @@ void Zone::Reset() {
+   limit_ = keep->end();
+   DCHECK_LT(allocation_size(), kAlignmentInBytes);
+   DCHECK_EQ(segment_bytes_allocated_, keep->total_size());
++  TraceZoneMemory(ZoneMemoryEvent::kReset, this, allocator_, keep,
++                  segment_bytes_allocated(), allocation_size(), 0, name_);
+ }
+ 
+ #ifdef DEBUG
+@@ -108,6 +133,8 @@ bool Zone::Contains(const void* ptr) const {
+ ZoneSnapshot Zone::Snapshot() const { return ZoneSnapshot{this}; }
+ 
+ void Zone::DeleteAll() {
++  TraceZoneMemory(ZoneMemoryEvent::kClear, this, allocator_, nullptr,
++                  segment_bytes_allocated(), allocation_size(), 0, name_);
+   Segment* current = segment_head_;
+   if (current) {
+     // Commit the allocation_size_ of segment_head_ and disconnect the segments
+@@ -196,6 +223,8 @@ void Zone::Expand(size_t size) {
+   limit_ = segment->end();
+   DCHECK_LE(position_, limit_);
+   DCHECK_LE(size, limit_ - position_);
++  TraceZoneMemory(ZoneMemoryEvent::kSegmentAdded, this, allocator_, segment,
++                  segment->total_size(), allocation_size(), size, name_);
+ }
+ 
+ void* Zone::ExpandAndAllocate(size_t size) {
+@@ -217,6 +246,9 @@ ZoneSnapshot::ZoneSnapshot(const Zone* zone)
+ }
+ 
+ void ZoneSnapshot::Restore(Zone* zone) const {
++  TraceZoneMemory(ZoneMemoryEvent::kPoint, zone, zone->allocator_, nullptr,
++                  zone->segment_bytes_allocated(), zone->allocation_size(), 0,
++                  zone->name_);
+   // Release segments up to the stored segment_head_.
+   Segment* current = zone->segment_head_;
+   while (current != segment_head_) {
+@@ -243,6 +275,9 @@ void ZoneSnapshot::Restore(Zone* zone) const {
+   zone->position_ = position_;
+   zone->limit_ = limit_;
+   zone->segment_head_ = segment_head_;
++  TraceZoneMemory(ZoneMemoryEvent::kRestore, zone, zone->allocator_, nullptr,
++                  zone->segment_bytes_allocated(), zone->allocation_size(), 0,
++                  zone->name_);
+ #ifdef V8_ENABLE_PRECISE_ZONE_STATS
+   zone->allocation_size_for_tracing_ = allocation_size_for_tracing_;
+   zone->freed_size_for_tracing_ = freed_size_for_tracing_;

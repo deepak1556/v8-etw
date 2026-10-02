@@ -1,0 +1,42 @@
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_root.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_root.cc
+index 0ff5072ca90a6..ddfaa4f6d9ae8 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_root.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_root.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ 
+ #include "partition_alloc/bucket_lookup.h"
+@@ -225,6 +226,17 @@ void UnlockOrReinitRoot(PartitionRoot* root,
+ #endif  // PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC) &&
+         // PA_CONFIG(HAS_ATFORK_HANDLER)
+ 
++void PartitionRoot::DumpAllStatsForTesting(PartitionStatsDumper* dumper) {
++  internal::ScopedGuard guard(GetEnumeratorLock());
++  internal::PartitionRootEnumerator::Instance().Enumerate(
++      +[](PartitionRoot* root, PartitionStatsDumper* output) {
++        char name[32];
++        snprintf(name, sizeof(name), "root-%p", static_cast<void*>(root));
++        root->DumpStats(name, false, true, output);
++      },
++      dumper, internal::PartitionRootEnumerator::EnumerateOrder::kNormal);
++}
++
+ #if PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC)
+ 
+ namespace {
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_root.h b/base/allocator/partition_allocator/src/partition_alloc/partition_root.h
+index 7a9cb1094906b..e07fef69528f6 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_root.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_root.h
+@@ -660,6 +660,7 @@ class alignas(internal::kPartitionCachelineSize)
+ 
+   PA_NOINLINE static void DumpIntendedLeakStats(PartitionStatsDumper* dumper);
+   PA_NOINLINE static void ClearIntendedLeakStatsForTesting();
++  PA_NOINLINE static void DumpAllStatsForTesting(PartitionStatsDumper* dumper);
+ 
+   static void DeleteForTesting(PartitionRoot* partition_root);
+   void ResetForTesting(bool allow_leaks);

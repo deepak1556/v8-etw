@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="V8MemorySystem" Name="V8 Memory System Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="256"/>
+    </SystemCollector>
+    <EventCollector Id="V8MemoryEvents" Name="V8 Memory Event Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="128"/>
+    </EventCollector>
+    <SystemProvider Id="V8MemoryKernel">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="Loader"/>
+        <Keyword Value="SampledProfile"/>
+        <Keyword Value="VirtualAllocation"/>
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile"/>
+        <Stack Value="VirtualAllocation"/>
+      </Stacks>
+    </SystemProvider>
+    <EventProvider Id="V8JIT" Name="57277741-3638-4A4B-BDBA-0AC6E45DA56C" Level="5">
+      <Keywords>
+        <Keyword Value="0x1"/>
+      </Keywords>
+    </EventProvider>
+    <EventProvider Id="MemoryProbe" Name="9EEB8A39-89E8-4C86-9F88-33083799F7D9" Level="5">
+      <Keywords>
+        <Keyword Value="0x1"/>
+      </Keywords>
+    </EventProvider>
+    <EventProvider Id="ZoneMemory" Name="76EC13F3-59C1-4527-A513-6453024CAB81" Level="5">
+      <Keywords><Keyword Value="0x1"/></Keywords>
+    </EventProvider>
+    <Profile Id="V8Memory.Verbose.File" Name="V8Memory" DetailLevel="Verbose"
+             LoggingMode="File" Description="V8 JIT metadata, CPU stacks and VirtualAlloc activity">
+      <Collectors>
+        <SystemCollectorId Value="V8MemorySystem">
+          <SystemProviderId Value="V8MemoryKernel"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="V8MemoryEvents">
+          <EventProviders>
+            <EventProviderId Value="V8JIT"/>
+            <EventProviderId Value="MemoryProbe"/>
+            <EventProviderId Value="ZoneMemory"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

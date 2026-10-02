@@ -1,0 +1,552 @@
+diff --git a/include/cppgc/internal/lifetime-observer.h b/include/cppgc/internal/lifetime-observer.h
+new file mode 100644
+index 00000000000..3d3dc9eb688
+--- /dev/null
++++ b/include/cppgc/internal/lifetime-observer.h
+@@ -0,0 +1,45 @@
++#ifndef INCLUDE_CPPGC_INTERNAL_LIFETIME_OBSERVER_H_
++#define INCLUDE_CPPGC_INTERNAL_LIFETIME_OBSERVER_H_
++
++#include <cstddef>
++#include <cstdint>
++
++namespace cppgc::internal {
++
++enum class LifetimeEventKind : uint8_t {
++  kHeapCreated,
++  kSeedBegin,
++  kSeedObject,
++  kSeedEnd,
++  kAllocation,
++  kFree,
++  kMove,
++  kResize,
++  kGcBegin,
++  kGcEnd,
++  kTypeName,
++  kHeapDestroyed,
++  kCaptureEnd,
++};
++
++struct LifetimeEvent {
++  LifetimeEventKind kind;
++  const void* heap;
++  uint64_t sequence;
++  uint64_t gc_epoch;
++  const void* address;
++  const void* other_address;
++  size_t bytes;
++  uint16_t gc_info;
++  bool major_gc;
++  const char* type_name;
++  size_t requested_bytes = 0;
++};
++
++// The callback may run on a concurrent sweeping thread. It must not allocate
++// managed objects or dereference payload addresses.
++using LifetimeObserver = void (*)(void*, const LifetimeEvent&);
++
++}  // namespace cppgc::internal
++
++#endif  // INCLUDE_CPPGC_INTERNAL_LIFETIME_OBSERVER_H_
+diff --git a/include/v8-cppgc.h b/include/v8-cppgc.h
+index 2bb82aa6f2c..865c9f7c545 100644
+--- a/include/v8-cppgc.h
++++ b/include/v8-cppgc.h
+@@ -12,6 +12,7 @@
+ #include "cppgc/common.h"
+ #include "cppgc/custom-space.h"
+ #include "cppgc/heap-statistics.h"
++#include "cppgc/internal/lifetime-observer.h"
+ #include "cppgc/visitor.h"
+ #include "v8-internal.h"       // NOLINT(build/include_directory)
+ #include "v8-platform.h"       // NOLINT(build/include_directory)
+@@ -86,6 +87,23 @@ class V8_EXPORT CppHeap {
+    */
+   cppgc::HeapHandle& GetHeapHandle();
+ 
++  // Diagnostic allocation-traffic probe. Runs before object construction on the
++  // heap's mutator thread; the callback must not allocate on or inspect the
++  // heap.
++  using AllocationObserverForTesting = void (*)(void* context,
++                                                const void* address,
++                                                size_t allocated_bytes);
++  void SetAllocationObserverForTesting(AllocationObserverForTesting observer,
++                                       void* context);
++
++  // Process-wide diagnostic lifetime stream, including newly created worker
++  // heaps. Seeds this heap; other pre-existing heaps are explicitly unseeded.
++  // Returns false when this heap is marking or another observer is installed.
++  bool StartLifetimeObserverForTesting(
++      cppgc::internal::LifetimeObserver observer, void* context);
++  void StopLifetimeObserverForTesting();
++  void EmitLifetimeTypeNamesForTesting();
++
+   /**
+    * \param detail_level specifies whether should return detailed
+    *   statistics or only brief summary statistics.
+diff --git a/src/heap/cppgc-internal/compactor.cc b/src/heap/cppgc-internal/compactor.cc
+index 231284efaa9..2244cd0b986 100644
+--- a/src/heap/cppgc-internal/compactor.cc
++++ b/src/heap/cppgc-internal/compactor.cc
+@@ -262,6 +262,10 @@ class CompactionState final {
+       compact_frontier = current_page_->PayloadStart();
+     }
+     if (V8_LIKELY(compact_frontier != header)) {
++      page->heap().NotifyLifetime(
++          LifetimeEventKind::kMove, header + sizeof(HeapObjectHeader),
++          compact_frontier + sizeof(HeapObjectHeader), size,
++          reinterpret_cast<HeapObjectHeader*>(header)->GetGCInfoIndex());
+       // Use a non-overlapping copy, if possible.
+       if (current_page_ == page) {
+         memmove(compact_frontier, header, size);
+@@ -356,6 +360,9 @@ void CompactPage(NormalPage* page, CompactionState& compaction_state,
+     }
+ 
+     if (!header->IsMarked()) {
++      page->heap().NotifyLifetime(LifetimeEventKind::kFree,
++                                  header->ObjectStart(), nullptr, size,
++                                  header->GetGCInfoIndex());
+       // Compaction is currently launched only from AtomicPhaseEpilogue, so it's
+       // guaranteed to be on the mutator thread - no need to postpone
+       // finalization.
+diff --git a/src/heap/cppgc-internal/explicit-management.cc b/src/heap/cppgc-internal/explicit-management.cc
+index 8f9b5efb04c..501b7a4260b 100644
+--- a/src/heap/cppgc-internal/explicit-management.cc
++++ b/src/heap/cppgc-internal/explicit-management.cc
+@@ -35,6 +35,13 @@ void ExplicitManagementImpl::FreeUnreferencedObject(HeapHandle& heap_handle,
+   }
+ 
+   auto& header = HeapObjectHeader::FromObject(object);
++  auto* lifetime_page = BasePage::FromPayload(object);
++  const size_t lifetime_bytes =
++      lifetime_page->is_large() ? LargePage::From(lifetime_page)->PayloadSize()
++                                : header.AllocatedSize();
++  lifetime_page->heap().NotifyLifetime(LifetimeEventKind::kFree, object,
++                                       nullptr, lifetime_bytes,
++                                       header.GetGCInfoIndex());
+   header.Finalize();
+ 
+   // `object` is guaranteed to be of type GarbageCollected, so getting the
+@@ -186,13 +193,19 @@ bool ExplicitManagementImpl::Resize(void* object, size_t new_object_size) {
+ 
+   auto& header = HeapObjectHeader::FromObject(object);
+   const size_t old_size = header.AllocatedSize();
++  bool resized = true;
+   if (new_size > old_size) {
+-    return Grow(header, *base_page, new_size, new_size - old_size);
++    resized = Grow(header, *base_page, new_size, new_size - old_size);
+   } else if (old_size > new_size) {
+-    return Shrink(header, *base_page, new_size, old_size - new_size);
++    resized = Shrink(header, *base_page, new_size, old_size - new_size);
++  }
++  if (resized) {
++    base_page->heap().NotifyLifetime(
++        LifetimeEventKind::kResize, object, nullptr, header.AllocatedSize(),
++        header.GetGCInfoIndex(), nullptr, new_object_size);
+   }
+   // Same size considering internal restrictions, e.g. alignment.
+-  return true;
++  return resized;
+ }
+ 
+ }  // namespace internal
+diff --git a/src/heap/cppgc-internal/heap-base.cc b/src/heap/cppgc-internal/heap-base.cc
+index 0c37f3645f6..6d64b807673 100644
+--- a/src/heap/cppgc-internal/heap-base.cc
++++ b/src/heap/cppgc-internal/heap-base.cc
+@@ -4,11 +4,14 @@
+ 
+ #include "src/heap/cppgc-internal/heap-base.h"
+ 
++#include <array>
++#include <atomic>
+ #include <memory>
+ 
+ #include "include/cppgc/heap-consistency.h"
+ #include "include/cppgc/platform.h"
+ #include "src/base/logging.h"
++#include "src/base/platform/mutex.h"
+ #include "src/base/sanitizer/lsan-page-allocator.h"
+ #include "src/heap/base/stack.h"
+ #include "src/heap/cppgc-internal/globals.h"
+@@ -31,6 +34,45 @@ namespace internal {
+ 
+ namespace {
+ 
++v8::base::LazyMutex g_lifetime_mutex = LAZY_MUTEX_INITIALIZER;
++std::atomic<LifetimeObserver> g_lifetime_observer{nullptr};
++void* g_lifetime_context = nullptr;
++HeapBase* g_lifetime_owner = nullptr;
++uint64_t g_lifetime_sequence = 0;
++
++class LifetimeInventory : private HeapVisitor<LifetimeInventory> {
++  friend class HeapVisitor<LifetimeInventory>;
++
++ public:
++  LifetimeInventory(HeapBase& heap, bool seed) : heap_(heap), seed_(seed) {}
++  void Run() { Traverse(heap_.raw_heap()); }
++
++ private:
++  bool VisitHeapObjectHeader(HeapObjectHeader& header) {
++    if (header.IsFree()) return true;
++    const auto bytes =
++        header.IsLargeObject()
++            ? LargePage::From(BasePage::FromPayload(header.ObjectStart()))
++                  ->PayloadSize()
++            : header.AllocatedSize();
++    if (seed_) {
++      heap_.NotifyLifetime(LifetimeEventKind::kSeedObject, header.ObjectStart(),
++                           nullptr, bytes, header.GetGCInfoIndex());
++    }
++    if (!header.IsInConstruction() && !types_seen_[header.GetGCInfoIndex()]) {
++      types_seen_[header.GetGCInfoIndex()] = true;
++      auto name = header.GetName(
++          HeapObjectNameForUnnamedObject::kUseClassNameIfSupported);
++      heap_.NotifyLifetime(LifetimeEventKind::kTypeName, nullptr, nullptr, 0,
++                           header.GetGCInfoIndex(), name.value);
++    }
++    return true;
++  }
++  HeapBase& heap_;
++  bool seed_;
++  std::array<bool, 1 << 14> types_seen_{};
++};
++
+ class ObjectSizeCounter : private HeapVisitor<ObjectSizeCounter> {
+   friend class HeapVisitor<ObjectSizeCounter>;
+ 
+@@ -136,9 +178,91 @@ HeapBase::HeapBase(
+   } else {
+     stack_->SetStackStart(v8::base::Stack::GetStackStart());
+   }
++  NotifyLifetime(LifetimeEventKind::kHeapCreated, nullptr, nullptr,
++                 sizeof(HeapObjectHeader));
++}
++
++HeapBase::~HeapBase() { NotifyLifetime(LifetimeEventKind::kHeapDestroyed); }
++
++void HeapBase::NotifyLifetime(LifetimeEventKind kind, const void* address,
++                              const void* other, size_t bytes, uint16_t gc_info,
++                              const char* type_name, size_t requested_bytes) {
++  if (!g_lifetime_observer.load(std::memory_order_acquire)) return;
++  v8::base::MutexGuard guard(g_lifetime_mutex.Pointer());
++  auto observer = g_lifetime_observer.load(std::memory_order_relaxed);
++  if (!observer) return;
++  const LifetimeEvent event{kind,
++                            this,
++                            ++g_lifetime_sequence,
++                            lifetime_gc_epoch_.load(),
++                            address,
++                            other,
++                            bytes,
++                            gc_info,
++                            lifetime_major_gc_.load(),
++                            type_name,
++                            requested_bytes};
++  observer(g_lifetime_context, event);
+ }
+ 
+-HeapBase::~HeapBase() = default;
++bool HeapBase::StartLifetimeObserverForTesting(LifetimeObserver observer,
++                                               void* context) {
++  CHECK(observer);
++  if (marker_) return false;
++  sweeper_.FinishIfRunning();
++  object_allocator_.ResetLinearAllocationBuffers();
++  {
++    v8::base::MutexGuard guard(g_lifetime_mutex.Pointer());
++    if (g_lifetime_observer.load()) return false;
++    g_lifetime_context = context;
++    g_lifetime_owner = this;
++    g_lifetime_sequence = 0;
++    g_lifetime_observer.store(observer, std::memory_order_release);
++  }
++  NotifyLifetime(LifetimeEventKind::kSeedBegin, nullptr, nullptr,
++                 sizeof(HeapObjectHeader));
++  EmitLifetimeInventoryForTesting(true);
++  NotifyLifetime(LifetimeEventKind::kSeedEnd);
++  return true;
++}
++
++void HeapBase::StopLifetimeObserverForTesting() {
++  sweeper_.FinishIfRunning();
++  v8::base::MutexGuard guard(g_lifetime_mutex.Pointer());
++  auto observer = g_lifetime_observer.load();
++  if (!observer) return;
++  CHECK_EQ(g_lifetime_owner, this);
++  const LifetimeEvent event{LifetimeEventKind::kCaptureEnd,
++                            this,
++                            ++g_lifetime_sequence,
++                            lifetime_gc_epoch_.load(),
++                            nullptr,
++                            nullptr,
++                            0,
++                            0,
++                            lifetime_major_gc_.load(),
++                            nullptr};
++  observer(g_lifetime_context, event);
++  g_lifetime_observer.store(nullptr, std::memory_order_release);
++  g_lifetime_owner = nullptr;
++  g_lifetime_context = nullptr;
++}
++
++void HeapBase::EmitLifetimeInventoryForTesting(bool seed) {
++  sweeper_.FinishIfRunning();
++  object_allocator_.ResetLinearAllocationBuffers();
++  LifetimeInventory(*this, seed).Run();
++}
++
++void HeapBase::NotifyLifetimeGcBegin(CollectionType type) {
++  lifetime_major_gc_.store(type == CollectionType::kMajor);
++  lifetime_gc_epoch_.fetch_add(1);
++  NotifyLifetime(LifetimeEventKind::kGcBegin);
++}
++
++void HeapBase::NotifyLifetimeGcEnd() {
++  NotifyLifetime(LifetimeEventKind::kGcEnd);
++}
+ 
+ PageAllocator* HeapBase::page_allocator() const {
+ #if defined(LEAK_SANITIZER)
+@@ -267,6 +391,7 @@ void HeapBase::Terminate() {
+ #endif  // defined(CPPGC_YOUNG_GENERATION)
+ 
+     in_atomic_pause_ = true;
++    NotifyLifetimeGcBegin(CollectionType::kMajor);
+     stats_collector()->NotifyMarkingStarted(CollectionType::kMajor,
+                                             GCConfig::MarkingType::kAtomic,
+                                             GCConfig::IsForcedGC::kForced);
+diff --git a/src/heap/cppgc-internal/heap-base.h b/src/heap/cppgc-internal/heap-base.h
+index 70f2409703c..483e61372bd 100644
+--- a/src/heap/cppgc-internal/heap-base.h
++++ b/src/heap/cppgc-internal/heap-base.h
+@@ -11,6 +11,7 @@
+ #include "include/cppgc/heap-handle.h"
+ #include "include/cppgc/heap-statistics.h"
+ #include "include/cppgc/heap.h"
++#include "include/cppgc/internal/lifetime-observer.h"
+ #include "include/cppgc/internal/persistent-node.h"
+ #include "include/cppgc/macros.h"
+ #include "src/base/macros.h"
+@@ -192,6 +193,16 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
+ 
+   HeapStatistics CollectStatistics(HeapStatistics::DetailLevel);
+ 
++  bool StartLifetimeObserverForTesting(LifetimeObserver, void*);
++  void StopLifetimeObserverForTesting();
++  void EmitLifetimeInventoryForTesting(bool seed);
++  void NotifyLifetime(LifetimeEventKind kind, const void* address = nullptr,
++                      const void* other = nullptr, size_t bytes = 0,
++                      uint16_t gc_info = 0, const char* type_name = nullptr,
++                      size_t requested_bytes = 0);
++  void NotifyLifetimeGcBegin(CollectionType type);
++  void NotifyLifetimeGcEnd();
++
+   EmbedderStackState stack_state_of_prev_gc() const {
+     return stack_state_of_prev_gc_;
+   }
+@@ -295,6 +306,8 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
+   int heap_thread_id_ = v8::base::OS::GetCurrentThreadId();
+ 
+   RawHeap raw_heap_;
++  std::atomic<uint64_t> lifetime_gc_epoch_{0};
++  std::atomic<bool> lifetime_major_gc_{false};
+   std::shared_ptr<cppgc::Platform> platform_;
+   std::unique_ptr<FatalOutOfMemoryHandler> oom_handler_;
+ 
+diff --git a/src/heap/cppgc-internal/marker.cc b/src/heap/cppgc-internal/marker.cc
+index 2ee79d0b335..f79ff0fa579 100644
+--- a/src/heap/cppgc-internal/marker.cc
++++ b/src/heap/cppgc-internal/marker.cc
+@@ -214,6 +214,7 @@ void MarkerBase::StartMarking() {
+           ? StatsCollector::kAtomicMark
+           : StatsCollector::kIncrementalMark);
+ 
++  heap().NotifyLifetimeGcBegin(config_.collection_type);
+   heap().stats_collector()->NotifyMarkingStarted(
+       config_.collection_type, config_.marking_type, config_.is_forced_gc);
+ 
+diff --git a/src/heap/cppgc-internal/object-allocator.cc b/src/heap/cppgc-internal/object-allocator.cc
+index 4f9b46c49cd..3429aaf1098 100644
+--- a/src/heap/cppgc-internal/object-allocator.cc
++++ b/src/heap/cppgc-internal/object-allocator.cc
+@@ -132,6 +132,17 @@ void* TryAllocateLargeObject(PageBackend& page_backend, LargePageSpace& space,
+ 
+ constexpr size_t ObjectAllocator::kSmallestSpaceSize;
+ 
++void* ObjectAllocator::NotifyAllocationForTesting(void* address, size_t bytes,
++                                                  size_t requested) {
++  raw_heap_.heap()->NotifyLifetime(
++      LifetimeEventKind::kAllocation, address, nullptr, bytes,
++      HeapObjectHeader::FromObject(address).GetGCInfoIndex(), nullptr,
++      requested);
++  if (allocation_observer_)
++    allocation_observer_(allocation_observer_context_, address, bytes);
++  return address;
++}
++
+ ObjectAllocator::ObjectAllocator(RawHeap& heap, PageBackend& page_backend,
+                                  StatsCollector& stats_collector,
+                                  PreFinalizerHandler& prefinalizer_handler,
+diff --git a/src/heap/cppgc-internal/object-allocator.h b/src/heap/cppgc-internal/object-allocator.h
+index 7baf3e84ab7..56cdf5b0cce 100644
+--- a/src/heap/cppgc-internal/object-allocator.h
++++ b/src/heap/cppgc-internal/object-allocator.h
+@@ -60,6 +60,12 @@ class V8_EXPORT_PRIVATE ObjectAllocator final : public cppgc::AllocationHandle {
+                               MayContainMixins);
+ 
+   void ResetLinearAllocationBuffers();
++  using AllocationObserverForTesting = void (*)(void*, const void*, size_t);
++  void SetAllocationObserverForTesting(AllocationObserverForTesting observer,
++                                       void* context) {
++    allocation_observer_ = observer;
++    allocation_observer_context_ = context;
++  }
+   void MarkAllPagesAsYoung();
+ 
+ #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
+@@ -70,6 +76,10 @@ class V8_EXPORT_PRIVATE ObjectAllocator final : public cppgc::AllocationHandle {
+ #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+ 
+  private:
++  void* NotifyAllocationForTesting(void* address, size_t allocated_bytes,
++                                   size_t requested_bytes);
++  AllocationObserverForTesting allocation_observer_ = nullptr;
++  void* allocation_observer_context_ = nullptr;
+   bool in_disallow_gc_scope() const;
+ 
+   // Returns the initially tried SpaceType to allocate an object of |size| bytes
+@@ -127,8 +137,10 @@ void* ObjectAllocator::AllocateObject(size_t size, GCInfoIndex gcinfo,
+       RoundUp<kAllocationGranularity>(size + sizeof(HeapObjectHeader));
+   const RawHeap::RegularSpaceType type =
+       GetInitialSpaceIndexForSize(allocation_size);
+-  return AllocateObjectOnSpace(NormalPageSpace::From(*raw_heap_.Space(type)),
+-                               allocation_size, gcinfo, may_contain_mixins);
++  return NotifyAllocationForTesting(
++      AllocateObjectOnSpace(NormalPageSpace::From(*raw_heap_.Space(type)),
++                            allocation_size, gcinfo, may_contain_mixins),
++      allocation_size, size);
+ }
+ 
+ void* ObjectAllocator::AllocateObject(size_t size, AlignVal alignment,
+@@ -142,9 +154,11 @@ void* ObjectAllocator::AllocateObject(size_t size, AlignVal alignment,
+       RoundUp<kAllocationGranularity>(size + sizeof(HeapObjectHeader));
+   const RawHeap::RegularSpaceType type =
+       GetInitialSpaceIndexForSize(allocation_size);
+-  return AllocateObjectOnSpace(NormalPageSpace::From(*raw_heap_.Space(type)),
+-                               allocation_size, alignment, gcinfo,
+-                               may_contain_mixins);
++  return NotifyAllocationForTesting(
++      AllocateObjectOnSpace(NormalPageSpace::From(*raw_heap_.Space(type)),
++                            allocation_size, alignment, gcinfo,
++                            may_contain_mixins),
++      allocation_size, size);
+ }
+ 
+ void* ObjectAllocator::AllocateObject(size_t size, GCInfoIndex gcinfo,
+@@ -156,9 +170,11 @@ void* ObjectAllocator::AllocateObject(size_t size, GCInfoIndex gcinfo,
+ #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+   const size_t allocation_size =
+       RoundUp<kAllocationGranularity>(size + sizeof(HeapObjectHeader));
+-  return AllocateObjectOnSpace(
+-      NormalPageSpace::From(*raw_heap_.CustomSpace(space_index)),
+-      allocation_size, gcinfo, may_contain_mixins);
++  return NotifyAllocationForTesting(
++      AllocateObjectOnSpace(
++          NormalPageSpace::From(*raw_heap_.CustomSpace(space_index)),
++          allocation_size, gcinfo, may_contain_mixins),
++      allocation_size, size);
+ }
+ 
+ void* ObjectAllocator::AllocateObject(size_t size, AlignVal alignment,
+@@ -171,9 +187,11 @@ void* ObjectAllocator::AllocateObject(size_t size, AlignVal alignment,
+ #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+   const size_t allocation_size =
+       RoundUp<kAllocationGranularity>(size + sizeof(HeapObjectHeader));
+-  return AllocateObjectOnSpace(
+-      NormalPageSpace::From(*raw_heap_.CustomSpace(space_index)),
+-      allocation_size, alignment, gcinfo, may_contain_mixins);
++  return NotifyAllocationForTesting(
++      AllocateObjectOnSpace(
++          NormalPageSpace::From(*raw_heap_.CustomSpace(space_index)),
++          allocation_size, alignment, gcinfo, may_contain_mixins),
++      allocation_size, size);
+ }
+ 
+ // static
+diff --git a/src/heap/cppgc-internal/sweeper.cc b/src/heap/cppgc-internal/sweeper.cc
+index b771a1b52de..413533b7046 100644
+--- a/src/heap/cppgc-internal/sweeper.cc
++++ b/src/heap/cppgc-internal/sweeper.cc
+@@ -386,6 +386,9 @@ typename FinalizationBuilder::ResultType SweepNormalPage(
+     }
+     // Check if object is not marked (not reachable).
+     if (!header->IsMarked<kAtomicAccess>()) {
++      page->heap().NotifyLifetime(LifetimeEventKind::kFree,
++                                  header->ObjectStart(), nullptr, size,
++                                  header->GetGCInfoIndex());
+       builder.AddFinalizer(header, size);
+       clear_bit_if_coalesced_entry(begin);
+       begin += size;
+@@ -753,6 +756,9 @@ class MutatorThreadSweeper final : private HeapVisitor<MutatorThreadSweeper> {
+     HeapObjectHeader* header = page.ObjectHeader();
+     CHECK(!header->IsMarked());
+     DCHECK_EQ(page.marked_bytes(), 0u);
++    page.heap().NotifyLifetime(LifetimeEventKind::kFree, header->ObjectStart(),
++                               nullptr, page.PayloadSize(),
++                               header->GetGCInfoIndex());
+     header->Finalize();
+     largest_consecutive_block_ =
+         std::max(page.PayloadSize(), largest_consecutive_block_);
+@@ -850,6 +856,9 @@ class ConcurrentSweepTask final : public cppgc::JobTask,
+     HeapObjectHeader* header = page.ObjectHeader();
+     CHECK(!header->IsMarked());
+     DCHECK_EQ(page.marked_bytes(), 0u);
++    page.heap().NotifyLifetime(LifetimeEventKind::kFree, header->ObjectStart(),
++                               nullptr, page.PayloadSize(),
++                               header->GetGCInfoIndex());
+ #if defined(CPPGC_CAGED_HEAP)
+     HeapObjectHeader* const unfinalized_objects =
+         header->IsFinalizable() ? page.ObjectHeader() : nullptr;
+@@ -1335,6 +1344,7 @@ class Sweeper::SweeperImpl final {
+     DCHECK(notify_done_pending_);
+     notify_done_pending_ = false;
+     stats_collector_->NotifySweepingCompleted(config_.sweeping_type);
++    heap_.heap()->NotifyLifetimeGcEnd();
+     if (config_.free_memory_handling == FreeMemoryHandling::kReleaseMemory) {
+       heap_.heap()->page_backend()->ReleasePooledPages();
+     }
+diff --git a/src/heap/cppgc-js/cpp-heap.cc b/src/heap/cppgc-js/cpp-heap.cc
+index c1de0c1c279..e8c205d2008 100644
+--- a/src/heap/cppgc-js/cpp-heap.cc
++++ b/src/heap/cppgc-js/cpp-heap.cc
+@@ -117,6 +117,28 @@ cppgc::HeapHandle& CppHeap::GetHeapHandle() {
+   return *internal::CppHeap::From(this);
+ }
+ 
++void CppHeap::SetAllocationObserverForTesting(
++    AllocationObserverForTesting observer, void* context) {
++  internal::CppHeap::From(this)
++      ->object_allocator()
++      .SetAllocationObserverForTesting(observer, context);
++}
++
++bool CppHeap::StartLifetimeObserverForTesting(
++    cppgc::internal::LifetimeObserver observer, void* context) {
++  return internal::CppHeap::From(this)
++      ->AsBase()
++      .StartLifetimeObserverForTesting(observer, context);
++}
++
++void CppHeap::StopLifetimeObserverForTesting() {
++  internal::CppHeap::From(this)->AsBase().StopLifetimeObserverForTesting();
++}
++
++void CppHeap::EmitLifetimeTypeNamesForTesting() {
++  internal::CppHeap::From(this)->AsBase().EmitLifetimeInventoryForTesting(
++      false);
++}
+ cppgc::HeapStatistics CppHeap::CollectStatistics(
+     cppgc::HeapStatistics::DetailLevel detail_level) {
+   return internal::CppHeap::From(this)->AsBase().CollectStatistics(
